@@ -12,8 +12,8 @@ venv/
 env/
 .ipynb_checkpoints/
 
-# Data (never commit)
-data/
+# Data (never commit) — anchor to repo root so src/data/ code is NOT ignored
+/data/
 *.parquet
 *.csv.gz
 *.h5
