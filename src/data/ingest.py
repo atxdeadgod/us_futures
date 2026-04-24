@@ -1,29 +1,44 @@
 """Algoseek US futures ingestion (TAQ v2 + multiple-depth) → polars DataFrames.
 
-Read-only streaming from the Expansion drive. No writes to HDD. Callers are
-responsible for materializing outputs to local parquet if needed.
+Path layout (default = HPC sync destination):
+    $ALGOSEEK_ROOT/{taq,depth,vix}/{root}/{YYYY}/{YYYYMMDD}/{EXPIRY}.csv.gz
+
+Overridable via env var `ALGOSEEK_ROOT`, or explicit `algoseek_root` kwarg.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import polars as pl
 
-ALGOSEEK_ROOT = Path("/Volumes/Expansion/algoseek_data")
-TAQ_TEMPLATE = "us-futures-taq-v2-{year}"
-DEPTH_TEMPLATE = "us-futures-muliple-depth-{year}"
+# Default HPC location (where the selective sync writes). Override via $ALGOSEEK_ROOT.
+DEFAULT_ALGOSEEK_ROOT = Path(
+    os.environ.get(
+        "ALGOSEEK_ROOT",
+        "/N/project/ksb-finance-backtesting/data/algoseek_futures",
+    )
+)
 
 TRADE_TYPES = {"TRADE", "TRADE AGRESSOR ON BUY", "TRADE AGRESSOR ON SELL"}
 QUOTE_TYPES = {"QUOTE BID", "QUOTE SELL"}
+
+# Algoseek Flag values (Table 5 of the TAQ guide).
+FLAG_REGULAR = 0
+FLAG_IMPLIED = 1
+FLAG_SHFLAG = 2  # session-high marker (Quantity=0)
+FLAG_SLFLAG = 4  # session-low marker (Quantity=0)
+FLAG_CALCULATED = 8  # CalculatedPrice — doc says exclude from bar aggregation
+FLAG_OPENING = 16
 
 
 @dataclass(frozen=True)
 class ContractFile:
     dataset: str  # "taq" or "depth"
     root: str  # contract root, e.g., "ES"
-    expiry: str  # expiry code, e.g., "ESM4"
+    expiry: str  # expiry code, e.g., "ESH4"
     day: date
     path: Path
 
@@ -41,29 +56,38 @@ def locate(
     root: str,
     expiry: str,
     day: date,
-    algoseek_root: Path = ALGOSEEK_ROOT,
+    algoseek_root: Path | str | None = None,
 ) -> ContractFile:
-    """Return the ContractFile descriptor for a given (dataset, root, expiry, day).
+    """Return the ContractFile descriptor under the new HPC layout:
 
-    dataset must be "taq" or "depth".
+        <root>/<dataset>/<root>/<YYYY>/<YYYYMMDD>/<EXPIRY>.csv.gz
+
+    `dataset` must be in {"taq","depth"}.
     """
-    if dataset == "taq":
-        template = TAQ_TEMPLATE
-    elif dataset == "depth":
-        template = DEPTH_TEMPLATE
-    else:
+    if dataset not in ("taq", "depth"):
         raise ValueError(f"dataset must be 'taq' or 'depth', got {dataset!r}")
-    year_dir = algoseek_root / template.format(year=day.year)
-    path = year_dir / _day_folder(day) / root / f"{expiry}.csv.gz"
+    root_dir = Path(algoseek_root) if algoseek_root else DEFAULT_ALGOSEEK_ROOT
+    path = root_dir / dataset / root / f"{day.year}" / _day_folder(day) / f"{expiry}.csv.gz"
     return ContractFile(dataset=dataset, root=root, expiry=expiry, day=day, path=path)
+
+
+def day_dir(
+    dataset: str,
+    root: str,
+    day: date,
+    algoseek_root: Path | str | None = None,
+) -> Path:
+    """Directory holding all expiry files for (dataset, root, day)."""
+    if dataset not in ("taq", "depth"):
+        raise ValueError(f"dataset must be 'taq' or 'depth', got {dataset!r}")
+    root_dir = Path(algoseek_root) if algoseek_root else DEFAULT_ALGOSEEK_ROOT
+    return root_dir / dataset / root / f"{day.year}" / _day_folder(day)
 
 
 def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCTime") -> pl.DataFrame:
     """Build a UTC nanosecond timestamp column `ts` from Algoseek YYYYMMDD + nanoseconds-of-day.
 
-    Algoseek TAQ UTCTime is 15 chars: HHMMSSnnnnnnnnn.
-    Depth UTCTime is 9 chars: microseconds-of-day-ish (narrower precision).
-    We right-pad to 15 and pull fields positionally.
+    TAQ UTCTime is 15 chars HHMMSSnnnnnnnnn. We right-pad to 15 and slice positionally.
     """
     return (
         df.with_columns(
@@ -86,7 +110,7 @@ def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCT
 
 
 def read_taq(cf: ContractFile) -> pl.DataFrame:
-    """Read a single Algoseek TAQ file. Returns polars DataFrame with parsed ts."""
+    """Read a single Algoseek TAQ file. Returns polars DataFrame with parsed `ts`."""
     if cf.dataset != "taq":
         raise ValueError("read_taq expects a taq ContractFile")
     if not cf.exists:
@@ -112,7 +136,7 @@ def read_taq(cf: ContractFile) -> pl.DataFrame:
 
 
 def read_depth(cf: ContractFile) -> pl.DataFrame:
-    """Read a single Algoseek multiple-depth file. Parsed ts; rows are per-side (B/S) L1-L10 book snapshots."""
+    """Read a single Algoseek multiple-depth file. Parsed `ts`; rows are per-side (B/S) L1..L10 snapshots."""
     if cf.dataset != "depth":
         raise ValueError("read_depth expects a depth ContractFile")
     if not cf.exists:
@@ -122,33 +146,45 @@ def read_depth(cf: ContractFile) -> pl.DataFrame:
 
 
 def split_trades_quotes(taq: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Split a raw TAQ frame into (trades, quotes), signed for trades via Algoseek aggressor flag.
+    """Split a raw TAQ frame into (trades, quotes).
 
-    Trades carry `aggressor_sign`: +1 for TRADE AGRESSOR ON BUY, -1 for AGRESSOR ON SELL,
-    0 for plain TRADE (no aggressor classification).
+    Filters per Algoseek doc:
+      - Trades: Type in {TRADE, TRADE AGRESSOR ON BUY, TRADE AGRESSOR ON SELL}
+                AND Quantity > 0                  # excludes SH/SL session markers
+                AND (Flags & 8) == 0              # excludes CalculatedPrice
+      - Quotes: Type in {QUOTE BID, QUOTE SELL}
 
-    Quotes carry `side`: 'bid' for QUOTE BID, 'ask' for QUOTE SELL.
+    Aggressor sign:
+      +1 = TRADE AGRESSOR ON BUY  (initiator buying, lifted the ask)
+      -1 = TRADE AGRESSOR ON SELL (initiator selling, hit the bid)
+       0 = plain TRADE (Algoseek couldn't classify the initiator)
     """
     trades = (
-        taq.filter(pl.col("Type").is_in(list(TRADE_TYPES)))
+        taq.filter(
+            pl.col("Type").is_in(list(TRADE_TYPES))
+            & (pl.col("Quantity") > 0)
+            & ((pl.col("Flags").cast(pl.Int64) & FLAG_CALCULATED) == 0)
+        )
         .with_columns(
             aggressor_sign=pl.when(pl.col("Type") == "TRADE AGRESSOR ON BUY")
             .then(1)
             .when(pl.col("Type") == "TRADE AGRESSOR ON SELL")
             .then(-1)
             .otherwise(0)
-            .cast(pl.Int8)
+            .cast(pl.Int8),
+            is_implied=(pl.col("Flags").cast(pl.Int64) & FLAG_IMPLIED).cast(pl.Boolean),
         )
-        .select(["ts", "Price", "Quantity", "aggressor_sign"])
+        .select(["ts", "Price", "Quantity", "aggressor_sign", "is_implied"])
         .rename({"Price": "price", "Quantity": "quantity"})
     )
 
     quotes = (
         taq.filter(pl.col("Type").is_in(list(QUOTE_TYPES)))
         .with_columns(
-            side=pl.when(pl.col("Type") == "QUOTE BID").then(pl.lit("bid")).otherwise(pl.lit("ask"))
+            side=pl.when(pl.col("Type") == "QUOTE BID").then(pl.lit("bid")).otherwise(pl.lit("ask")),
+            is_implied=(pl.col("Flags").cast(pl.Int64) & FLAG_IMPLIED).cast(pl.Boolean),
         )
-        .select(["ts", "side", "Price", "Quantity", "Orders"])
+        .select(["ts", "side", "Price", "Quantity", "Orders", "is_implied"])
         .rename({"Price": "price", "Quantity": "size", "Orders": "orders"})
     )
 
