@@ -153,9 +153,9 @@ def pull_year(cur, ticker: str, year: int, out_dir: Path, discovered: dict, seci
         try:
             if date_range is None:
                 sql = f"""
-                    SELECT date, secid, symbol, strike_price, exdate, cp_flag,
+                    SELECT date, secid, strike_price, exdate, cp_flag,
                            best_bid, best_offer, volume, open_interest,
-                           impl_volatility, delta, gamma, vega, theta
+                           impl_volatility, delta, gamma
                     FROM {table}
                     WHERE secid IN %s
                     ORDER BY date, secid, exdate, strike_price, cp_flag

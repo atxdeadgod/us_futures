@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
+#SBATCH --mem=32G
 #SBATCH --time=04:00:00
 #SBATCH --output=/N/project/ksb-finance-backtesting/data/spx_options_chain/slurm-%j.out
 #SBATCH --error=/N/project/ksb-finance-backtesting/data/spx_options_chain/slurm-%j.err
