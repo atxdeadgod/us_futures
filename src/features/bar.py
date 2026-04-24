@@ -208,13 +208,13 @@ def price_impact_slope(
 # ---------------------------------------------------------------------------
 
 def is_monday(ts_col: pl.Expr) -> pl.Expr:
-    """T6.02: weekday() == 0."""
-    return (ts_col.dt.weekday() == 0).cast(pl.Int8)
+    """T6.02: Monday flag. Polars dt.weekday() uses ISO convention (Mon=1..Sun=7)."""
+    return (ts_col.dt.weekday() == 1).cast(pl.Int8)
 
 
 def is_friday(ts_col: pl.Expr) -> pl.Expr:
-    """T6.02: weekday() == 4 (Mon=0)."""
-    return (ts_col.dt.weekday() == 4).cast(pl.Int8)
+    """T6.02: Friday flag. Polars dt.weekday() uses ISO (Fri=5)."""
+    return (ts_col.dt.weekday() == 5).cast(pl.Int8)
 
 
 def is_month_start(ts_col: pl.Expr) -> pl.Expr:
