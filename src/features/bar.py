@@ -266,3 +266,29 @@ def vwap_deviation(close_col: pl.Expr, session_vwap_col: pl.Expr) -> pl.Expr:
     Positive = bar closed above the session volume-weighted average price.
     """
     return close_col - session_vwap_col
+
+
+# ---------------------------------------------------------------------------
+# T6.01  Intraday seasonal deviation
+# ---------------------------------------------------------------------------
+
+def intraday_seasonal_deviation(
+    value_col: str,
+    time_of_day_col: str = "_tod",
+    window: int = 20,
+) -> pl.Expr:
+    """T6.01: value − rolling-mean-over-days-at-same-time-of-day.
+
+    Heston-Korajczyk-Sadka style: for each row, the baseline is the rolling
+    mean of `value_col` computed WITHIN a group defined by `time_of_day_col`
+    (e.g., every 14:30 ET bar across the last `window` days). Returns the
+    deviation from that baseline.
+
+    Caller must pre-populate `time_of_day_col` (typically via
+    `pl.col("ts").dt.time().alias("_tod")`) and pass the COLUMN NAMES so
+    that polars' over() clause can reference them.
+    """
+    return (
+        pl.col(value_col)
+        - pl.col(value_col).rolling_mean(window_size=window).over(time_of_day_col)
+    )
