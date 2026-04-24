@@ -95,41 +95,104 @@ European/Asian indices intraday during US RTH; individual commodity futures (CL/
 
 ---
 
-## 3. Model
+## 3. Labels, model, and meta-labeling
 
-**Baseline**: Ridge regression, multi-task (auxiliary 5/30/60-min horizons), with L2 penalty tuned on walk-forward CV. Monthly refit, 3-month embargoed holdout.
+### 3.1 Triple-barrier labels (primary model training)
 
-**Stretch**: LightGBM single-task on 15-min horizon, with categorical handling for time-of-day and event flags.
+Following Lopez de Prado (AFML Ch. 3). For each candidate entry bar `t`, define three barriers:
 
-**Validation**:
-- Expanding-window walk-forward, monthly refits
+- **Upper** (profit): `price_t × (1 + k_up × ATR_t / price_t)`
+- **Lower** (stop): `price_t × (1 − k_dn × ATR_t / price_t)`
+- **Vertical** (time): `t + T` bars
+
+Label = first barrier touched, yielding one of `{+1, −1, 0}` (upper / lower / time-expired). This replaces hand-designed return-threshold labels and naturally encodes the trading horizon + risk asymmetry.
+
+Starting barrier params (placeholders, to be tuned):
+- `k_up` ≈ 1.5 (in ATR units)
+- `k_dn` ≈ 1.0
+- `T` ≈ 12 bars (3 hours on 15-min bars)
+- `ATR_t` computed on 20-bar rolling window
+
+### 3.2 Primary model
+
+**Baseline**: Ridge regression, ternary (sign of triple-barrier label) or continuous forward return at 15-min horizon. Multi-task variant predicts auxiliary 5/30/60-min horizons for regularization. L2 penalty tuned on walk-forward CV.
+
+**Stretch**: LightGBM single-task classifier on ternary labels; handles time-of-day + event flags as categoricals.
+
+### 3.3 Meta-labeling (secondary model)
+
+Per AFML Ch. 3: on top of the primary model, train a second binary classifier predicting `should_take_signal ∈ {0, 1}` given the primary signal, its confidence, and the feature set. Purpose:
+
+- Improves precision by filtering low-conviction primary signals
+- Natural home for bet-size scaling (predicted probability → position size multiplier)
+- Cleanly isolates direction decision (primary) from trade-or-skip decision (meta)
+
+Output: final signal = `primary_sign × meta_prob × vol_scaler`, thresholded against trade-admission gates.
+
+### 3.4 Validation
+
+- **Walk-forward with purging + embargo** (AFML Ch. 7): train on expanding window, predict next month, purge overlapping labels and embargo `T` bars around each fold boundary to prevent label leakage
+- **2025 is holdout — untouched during any hyperparameter selection**
 - Year-by-year IC calibration (2020/21/22/23/24) per feature to flag single-regime features
-- ILP-based ρ<0.45 feature selection (reuse `stage2_ilp_selection` from `tognn_us` adapted)
-- Dashboard v2 on ES bars (futures analog of equity 864-feature dashboard)
+- ILP-based ρ < 0.45 feature selection (reuse `stage2_ilp_selection` from `tognn_us` adapted)
+- Dashboard v2 on ES bars — futures analog of the 864-feature equity dashboard (`tognn_us/data/feature_dashboard_v2_sector_beta.csv`)
+
+### 3.5 Hyperparameter tuning
+
+- **Bayesian optimization via Optuna** (not random search) over primary + meta + barrier params, using walk-forward objective with embargo
+- Fixed search budget per refit; report parameter stability across folds as a confidence diagnostic
+- Metrics to optimize (in priority order):
+  1. OOS Sharpe net of modeled costs
+  2. Realized R per winning trade (not just hit rate)
+  3. Max drawdown bounded
+  4. Parameter stability across folds
 
 ---
 
 ## 4. Trade management layer
 
-The signal is multiplied by this layer; ~50% of realized Sharpe lives here.
+~50% of realized Sharpe lives here. Structure follows triple-barrier exits (inherited from label construction) + a small number of pre-trade filters and post-entry overrides.
 
-| Component | Rule |
+### 4.1 Pre-trade filters (entry gates)
+
+| Gate | Rule |
 |---|---|
-| Signal threshold | Trade only if \|ŷ\| > k·σ(ŷ); k tuned on walk-forward |
-| Vol-scaled sizing | position ∝ ŷ / σ², capped at per-trade and daily gross limits |
-| ATR-based stop | Flatten on 2×ATR adverse; profit-take at 1.5–2×ATR |
-| Time stop | Auto-flatten at signal horizon (15–30 min) regardless of P&L |
-| Trailing stop | Ratchet stop on favourable moves; never loosen |
-| Target ratchet | On target-cross: lock a tighter stop, shrink subsequent target |
-| Regime gate | Suspend if VIX > 30, or macro event ±15 min, or spread > 2× normal |
-| Cost gate | Skip trade if \|ŷ\| × notional < 3× expected (half-spread + fees) |
-| Opposing-signal cut | Exit position immediately on opposing signal when in loss |
-| Slope-confirmation filter | Only enter if multi-window (10/20/30) slopes agree with signal direction |
-| Daily DD kill-switch | Hard shut-off at −2% book DD |
-| Trade frequency cap | Max ~20 round-trips/day (tune) |
-| EOD flattening | Flat by 15:45 ET if in loss; flat by 16:00 ET unconditional |
-| Live slippage tracker | Realized vs model fills; widen thresholds if slippage > budget |
-| PnL attribution | Decompose daily PnL: signal edge, cost, slippage, timing |
+| Signal threshold | Enter only if \|meta_prob × primary_sign\| > k_entry; tuned walk-forward |
+| Cost gate | Skip if expected edge × notional < 3 × expected round-trip cost |
+| Regime gate | Suspend if VIX > 30, or macro event ±15 min, or spread > 2 × normal |
+| Slope-confirmation filter (optional) | Enter only if multi-window (10/20/30) slopes agree with signal direction — inherited from legacy framework as a whipsaw defence; **ablation-test against no-filter variant** before including |
+| Trade-frequency cap | Max N round-trips/day (N tuned) |
+
+### 4.2 Post-entry rules
+
+| Rule | Behaviour |
+|---|---|
+| Triple-barrier exits | Upper (profit), lower (stop), vertical (time) from the label spec — first touch wins, exit on touch |
+| Trailing lower barrier (optional) | Ratchet the lower barrier only in favour direction (never loosen); ATR-based step |
+| Opposing-signal override | If new primary signal is opposite and conviction > k_override, exit regardless of barrier state and P&L |
+| EOD flatten | Flat by 15:45 ET if in loss; flat by 16:00 ET unconditional (ES CME close is 17:00 ET — policy chooses earlier flatten) |
+
+### 4.3 Sizing
+
+- `position = notional_cap × meta_prob × primary_sign / σ_target`
+- `σ_target` = rolling 20-bar realized vol × vol_scale
+- Per-trade cap, daily gross cap, per-instrument gross cap
+
+### 4.4 Book-level risk
+
+| Rule | Threshold |
+|---|---|
+| Daily drawdown kill-switch | Hard shut-off at −2% book DD; resume next day |
+| Weekly drawdown flag | At −5% rolling weekly DD, cut sizing in half; manual review |
+| Slippage monitor | Realized vs model fills; if slippage > budget for 5 consecutive days, widen entry threshold |
+| PnL attribution | Decompose daily PnL: signal edge, cost, slippage, timing; reviewed daily |
+
+### 4.5 Design principles (carried from review)
+
+- **Start minimal, add only what ablation-tests justify** — every parameter is a potential overfit
+- **Measure realized R per winner**, not just hit rate; optimize `realized_R × hit_rate − (1 − hit_rate) − costs`
+- **Primary model handles direction + horizon; trade manager handles principled risk** — don't let trade-management compensate for weak signal
+- **Live-backtest parity**: simulate slicing, slippage, partial fills, rejected orders in backtest with same order logic as live
 
 ---
 
@@ -157,14 +220,16 @@ The signal is multiplied by this layer; ~50% of realized Sharpe lives here.
 
 ## 7. Build order (6–8 weeks)
 
-1. **Data ingestion** (week 1): Algoseek ES depth + TAQ → polars → 15-min bars + 1-min microstructure features
-2. **Feature engineering** (weeks 2–3): Tiers 1 + 2 + 3 via `feature-factory`; add `DeepOFI` class
-3. **Dashboard v2 on ES** (week 3): IC/t/icir at 5/15/30/60-min horizons
-4. **Model baseline** (week 4): Ridge multi-task + walk-forward backtest, aim ≥1.0 net Sharpe as floor
-5. **Add Tiers 4/5/6** (week 5): cross-sectional equity features, vol regime, temporal; re-dashboard, re-train
-6. **Trade management** (weeks 5–6): ATR stops, trailing, regime gate, cost gate, slope confirmation
-7. **Cost realism & validation** (week 7): 2025 OOS, slippage calibration, DD kill-switch testing
-8. **Paper trade + live readiness** (week 8): IBKR integration, live parity check, go-live checklist
+1. **Data ingestion** (week 1): Algoseek ES depth + TAQ → polars → 15-min bars + 1-min microstructure features; contract-roll logic for continuous front-month series
+2. **Feature engineering** (weeks 2–3): Tiers 1 + 2 + 3 via `feature-factory`; add `DeepOFI` class; incremental / cached feature computation so live updates are cheap
+3. **Triple-barrier labeling** (week 2, parallel): label generator, ATR compute, purge + embargo utilities
+4. **Dashboard v2 on ES** (week 3): IC/t/icir at 5/15/30/60-min horizons across all features
+5. **Primary model baseline** (week 4): Ridge on triple-barrier labels + walk-forward backtest with Optuna tuning, aim ≥1.0 net Sharpe as floor
+6. **Add Tiers 4/5/6** (week 5): cross-sectional equity features, vol regime, temporal; re-dashboard, re-train
+7. **Meta-labeling model** (week 5): binary classifier, bet-size gate, precision-recall analysis on 2024
+8. **Trade manager module** (weeks 5–6): triple-barrier exits + filters + overrides + sizing + kill-switches; unit-tested state machine, thread-safe
+9. **Cost realism & validation** (week 7): 2025 OOS (first time it's touched), slippage calibration, DD kill-switch testing, live-backtest parity check
+10. **Paper trade + live readiness** (week 8): IBKR integration via `ib_insync`, live parity check vs backtest, go-live checklist
 
 ---
 

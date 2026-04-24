@@ -2,6 +2,8 @@
 
 Status: draft, 2026-04-23. Prepared alongside initial repo setup.
 
+**Modeling convention (carries across phases)**: primary model trained on **triple-barrier labels** (AFML Ch. 3) with **meta-labeling** on top for bet-size gating; tuning via **walk-forward Bayesian optimization with purging + embargo**; 2025 is the holdout fold, untouched during any parameter selection. Details in [`PHASE1_DIRECTIONAL_ES.md`](PHASE1_DIRECTIONAL_ES.md) §3.
+
 ---
 
 ## 0. Key translation: daily → intraday
