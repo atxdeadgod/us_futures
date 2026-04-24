@@ -24,7 +24,7 @@ from ..features.engines import cvd_with_dual_reset
 BAR_EVERY = "5s"
 
 
-def _l1_stream(quotes: pl.DataFrame) -> pl.DataFrame:
+def l1_stream(quotes: pl.DataFrame) -> pl.DataFrame:
     """Build an L1-mid event stream from the quote stream.
 
     Quotes arrive as per-side updates (either bid or ask). We forward-fill across
@@ -66,7 +66,7 @@ def build_5sec_bars_core(
 ) -> pl.DataFrame:
     """Emit Phase A core columns only. Phase B book-depth enrichment separately."""
     # ---- L1 stream (for mid/spread/quote close aggregates) ----
-    l1 = _l1_stream(quotes)
+    l1 = l1_stream(quotes)
 
     # ---- OHLCV + aggressor aggregation ----
     trade_bars = (
