@@ -8,8 +8,8 @@
 #SBATCH --mem=48G
 #SBATCH --time=06:00:00
 #SBATCH --array=0-3
-#SBATCH --output=/N/project/ksb-finance-backtesting/data/label_tuning/slurm-%A_%a.out
-#SBATCH --error=/N/project/ksb-finance-backtesting/data/label_tuning/slurm-%A_%a.err
+#SBATCH --output=/N/project/ksb-finance-backtesting/data/label_tuning/results/slurm-%A_%a.out
+#SBATCH --error=/N/project/ksb-finance-backtesting/data/label_tuning/results/slurm-%A_%a.err
 #SBATCH --mail-type=END,FAIL
 
 # Array job: one task per instrument.
@@ -27,17 +27,17 @@ INSTRUMENTS=(ES NQ RTY YM)
 INSTR="${INSTRUMENTS[$SLURM_ARRAY_TASK_ID]}"
 echo "=== instrument = $INSTR ==="
 
-mkdir -p /N/project/ksb-finance-backtesting/data/label_tuning
+mkdir -p /N/project/ksb-finance-backtesting/data/label_tuning/results
 
 source /N/slate/gargru/miniforge3/etc/profile.d/conda.sh
 conda activate bhft
 
-# Bars path convention: one parquet per (instrument, day) at 15-min horizon.
-# Adjust BARS_ROOT if the bar-building pipeline writes elsewhere.
-BARS_ROOT="${BARS_ROOT:-/N/project/ksb-finance-backtesting/data/bars}"
+# Bars path convention: one parquet per (instrument, day) at 15-min horizon,
+# written by scripts/build_bars_range.{py,sbatch}.
+BARS_ROOT="${BARS_ROOT:-/N/project/ksb-finance-backtesting/data/label_tuning/bars_ohlcv}"
 BARS_GLOB="${BARS_ROOT}/${INSTR}/15m/${INSTR}_*_15m.parquet"
 
-OUT_DIR=/N/project/ksb-finance-backtesting/data/label_tuning
+OUT_DIR=/N/project/ksb-finance-backtesting/data/label_tuning/results
 OUT_CSV="${OUT_DIR}/${INSTR}_tune_2020_2023.csv"
 
 python3 -u "$HOME/us_futures/scripts/tune_labels.py" \
