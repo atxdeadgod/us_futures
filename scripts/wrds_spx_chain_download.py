@@ -55,20 +55,70 @@ def get_conn():
     return conn
 
 
-def secid_for_ticker(cur, ticker: str, year: int) -> list[int]:
-    """Look up SPX/SPXW/SPY security IDs used by WRDS optionm for a given year."""
+def discover_tables(cur) -> dict:
+    """Discover actual table names in optionm — don't guess, ask."""
     cur.execute(
         """
-        SELECT DISTINCT secid
-        FROM optionm.secnmd
-        WHERE ticker = %s
-        """,
-        (ticker,),
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'optionm'
+        ORDER BY table_name
+        """
     )
-    return [row[0] for row in cur.fetchall()]
+    all_tables = [r[0] for r in cur.fetchall()]
+    # Options pricing tables (by year and by view)
+    opprcd_by_year = {}
+    opprcd_unified = None
+    secid_tables = []
+    for t in all_tables:
+        low = t.lower()
+        # Match opprcd1996, opprcd2014, opprcd_2024 etc.
+        if low.startswith("opprcd"):
+            rest = low[len("opprcd"):]
+            if rest.startswith("_"):
+                rest = rest[1:]
+            if rest.isdigit() and len(rest) == 4:
+                opprcd_by_year[int(rest)] = t
+            elif rest.isdigit() and len(rest) == 2:
+                # 2-digit year → map to 4-digit
+                y2 = int(rest)
+                yr = 1900 + y2 if y2 >= 50 else 2000 + y2
+                opprcd_by_year[yr] = t
+            elif rest == "":
+                opprcd_unified = t
+        if low in ("securd1", "secnmd", "securities", "secur") or low.startswith("secname") or low.startswith("security"):
+            secid_tables.append(t)
+    print(f"[discover] optionm tables total: {len(all_tables)}", flush=True)
+    print(f"[discover] opprcd by year: {sorted(opprcd_by_year.items())[-10:] if opprcd_by_year else '(none)'}", flush=True)
+    print(f"[discover] opprcd unified: {opprcd_unified!r}", flush=True)
+    print(f"[discover] secid tables: {secid_tables}", flush=True)
+    return {
+        "opprcd_by_year": opprcd_by_year,
+        "opprcd_unified": opprcd_unified,
+        "secid_tables": secid_tables,
+        "all_tables": all_tables,
+    }
 
 
-def pull_year(cur, ticker: str, year: int, out_dir: Path) -> dict:
+def secid_for_ticker(cur, ticker: str, secid_tables: list[str]) -> list[int]:
+    """Look up SPX/SPXW/SPY security IDs; tries each candidate secid table."""
+    for tbl in secid_tables:
+        for col_ticker in ("ticker", "symbol", "issuer"):
+            try:
+                cur.execute(
+                    f"SELECT DISTINCT secid FROM optionm.{tbl} WHERE {col_ticker} = %s",
+                    (ticker,),
+                )
+                rows = [r[0] for r in cur.fetchall()]
+                if rows:
+                    return rows
+            except Exception:
+                continue
+    # Last resort: cols may be called index_flag + index_name
+    return []
+
+
+def pull_year(cur, ticker: str, year: int, out_dir: Path, discovered: dict, secids: list[int]) -> dict:
     out_file = out_dir / ticker / f"{year}.parquet"
     if out_file.exists() and out_file.stat().st_size > 10_000:
         try:
@@ -79,33 +129,54 @@ def pull_year(cur, ticker: str, year: int, out_dir: Path) -> dict:
             pass
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Secid lookup is per-year because optionm may reassign
-    secids = secid_for_ticker(cur, ticker, year)
     if not secids:
-        return {"status": f"no-secid for {ticker}/{year}", "rows": 0}
+        return {"status": f"no-secid for {ticker}", "rows": 0}
 
-    # Some years reside in optionm.opprcd<yy>; others in opprcd_<yyyy>. Try both.
-    # (Per WRDS docs the canonical is opprcd<yy> for legacy; opprcd_<yyyy> for newer.)
-    candidate_tables = [f"optionm.opprcd{year % 100:02d}", f"optionm.opprcd_{year}"]
+    # Candidate sources: per-year table, then unified-with-date-filter
+    candidates = []
+    if year in discovered["opprcd_by_year"]:
+        candidates.append(("optionm." + discovered["opprcd_by_year"][year], None))
+    if discovered["opprcd_unified"]:
+        # Use unified with date filter
+        date_lo = f"{year}-01-01"
+        date_hi = f"{year}-12-31"
+        candidates.append(("optionm." + discovered["opprcd_unified"], (date_lo, date_hi)))
+
+    if not candidates:
+        return {"status": f"no-table-for-year-{year}", "rows": 0}
+
     rows = None
+    cols = None
+    source_table = None
     last_err = None
-    for table in candidate_tables:
+    for table, date_range in candidates:
         try:
-            sql = f"""
-                SELECT date, secid, symbol, strike_price, exdate, cp_flag,
-                       best_bid, best_offer, volume, open_interest,
-                       impl_volatility, delta, gamma, vega, theta
-                FROM {table}
-                WHERE secid IN %s
-                ORDER BY date, secid, exdate, strike_price, cp_flag
-            """
-            cur.execute(sql, (tuple(secids),))
+            if date_range is None:
+                sql = f"""
+                    SELECT date, secid, symbol, strike_price, exdate, cp_flag,
+                           best_bid, best_offer, volume, open_interest,
+                           impl_volatility, delta, gamma, vega, theta
+                    FROM {table}
+                    WHERE secid IN %s
+                    ORDER BY date, secid, exdate, strike_price, cp_flag
+                """
+                cur.execute(sql, (tuple(secids),))
+            else:
+                sql = f"""
+                    SELECT date, secid, symbol, strike_price, exdate, cp_flag,
+                           best_bid, best_offer, volume, open_interest,
+                           impl_volatility, delta, gamma, vega, theta
+                    FROM {table}
+                    WHERE secid IN %s AND date >= %s AND date <= %s
+                    ORDER BY date, secid, exdate, strike_price, cp_flag
+                """
+                cur.execute(sql, (tuple(secids), date_range[0], date_range[1]))
             cols = [d.name for d in cur.description]
             rows = cur.fetchall()
             source_table = table
             break
         except Exception as exc:
-            last_err = str(exc)[:140]
+            last_err = str(exc)[:200]
             continue
 
     if rows is None:
@@ -155,9 +226,17 @@ def main() -> int:
     total_rows = 0
     total_bytes = 0
     try:
+        discovered = discover_tables(cur)
+        # Secid lookup per ticker (same across years)
+        ticker_secids = {}
+        for ticker in tickers:
+            sids = secid_for_ticker(cur, ticker, discovered["secid_tables"])
+            ticker_secids[ticker] = sids
+            print(f"[spx-chain] secids for {ticker}: {sids}", flush=True)
+
         for ticker in tickers:
             for year in years:
-                result = pull_year(cur, ticker, year, out_root)
+                result = pull_year(cur, ticker, year, out_root, discovered, ticker_secids[ticker])
                 total_rows += result.get("rows", 0)
                 total_bytes += result.get("bytes", 0)
                 print(f"[spx-chain] {ticker}/{year}: {result}", flush=True)
