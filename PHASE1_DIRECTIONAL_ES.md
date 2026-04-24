@@ -16,9 +16,16 @@ Status: draft, 2026-04-23. Narrow-start first milestone before expanding to the 
 
 ---
 
-## 2. Feature set (~50–60 features, 6 tiers)
+## 2. Feature set — wide candidate pool → ILP-selected survivors
 
-Informational inputs only — no cross-sectional panel construction since we predict ES alone. Features span asset classes as *predictors*, not as a cross-section to rank.
+**Strategy**: mirror the equity-book flow (`tognn_us`: 864 dashboard variants → ILP → 77 selected). Start wide, let dashboard IC + ILP with correlation constraint do the selection discipline.
+
+- **Base features**: ~60 across 6 tiers below (informational inputs only — no cross-sectional panel construction since we predict ES alone; features span asset classes as *predictors*, not as a cross-section to rank)
+- **Variant expansion**: parameter grids per applicable feature over `{windows: 5, 10, 15, 20, 30, 60}`, `{lags: 1, 3, 5, 10}`, `{depths: 1, 3, 5, 10}`, transforms `{raw, rolling_z, ema3, slope_N, rank_over_window}`
+- **Candidate pool**: ~300–800 feature×variant combinations
+- **Dashboard pass**: IC / t / ICIR / hit-rate at 5 / 15 / 30 / 60-min horizons (direct analog of `feature_dashboard_v2_sector_beta.csv`)
+- **ILP selection**: ρ < 0.45 correlation constraint, select top `~40–80` by max_abs_t (reuse `stage2_ilp_selection.py` adapted)
+- **Transform strategy for single instrument**: since cross-sectional rank is undefined (N=1), replace Gauss-rank with **rolling time-series z-score** or **rolling quantile rank** over a 252-bar window; decide by ablation
 
 ### Tier 1 — ES own microstructure (highest expected IC)
 
@@ -221,11 +228,11 @@ Output: final signal = `primary_sign × meta_prob × vol_scaler`, thresholded ag
 ## 7. Build order (6–8 weeks)
 
 1. **Data ingestion** (week 1): Algoseek ES depth + TAQ → polars → 15-min bars + 1-min microstructure features; contract-roll logic for continuous front-month series
-2. **Feature engineering** (weeks 2–3): Tiers 1 + 2 + 3 via `feature-factory`; add `DeepOFI` class; incremental / cached feature computation so live updates are cheap
+2. **Feature engineering — wide generation** (weeks 2–3): all 6 tiers via `feature-factory` with parameter grids; add custom classes (`DeepOFI`, etc.); incremental/cached computation so live updates are cheap
 3. **Triple-barrier labeling** (week 2, parallel): label generator, ATR compute, purge + embargo utilities
-4. **Dashboard v2 on ES** (week 3): IC/t/icir at 5/15/30/60-min horizons across all features
-5. **Primary model baseline** (week 4): Ridge on triple-barrier labels + walk-forward backtest with Optuna tuning, aim ≥1.0 net Sharpe as floor
-6. **Add Tiers 4/5/6** (week 5): cross-sectional equity features, vol regime, temporal; re-dashboard, re-train
+4. **Dashboard v2 on ES** (week 3): IC/t/icir/hit-rate at 5/15/30/60-min horizons across all candidate features (~300–800)
+5. **ILP feature selection** (week 3): ρ<0.45 constraint, top 40–80 selected — reuse `stage2_ilp_selection` from `tognn_us` adapted
+6. **Primary model baseline** (week 4): LightGBM (baseline) + Ridge (ablation) on triple-barrier labels, walk-forward backtest with Optuna tuning, aim ≥1.0 net Sharpe as floor
 7. **Meta-labeling model** (week 5): binary classifier, bet-size gate, precision-recall analysis on 2024
 8. **Trade manager module** (weeks 5–6): triple-barrier exits + filters + overrides + sizing + kill-switches; unit-tested state machine, thread-safe
 9. **Cost realism & validation** (week 7): 2025 OOS (first time it's touched), slippage calibration, DD kill-switch testing, live-backtest parity check
@@ -242,10 +249,15 @@ Output: final signal = `primary_sign × meta_prob × vol_scaler`, thresholded ag
 
 ---
 
-## 9. Expansion path
+## 9. Strategy evolution path
 
-**Phase 2**: same per-instrument directional model replicated on NQ, RTY, YM (4 equity index models running independently); optional correlation-aware book-level sizing.
+Each version proves its own edge before adding the next. Moving from directional → arbitrage is where the Sharpe step-up comes from (dollar-neutral construction reduces vol); this path earns it in stages.
 
-**Phase 3**: extend to 30-contract cross-asset per-instrument book per [`DESIGN.md`](DESIGN.md).
+| Version | Scope | Expected net Sharpe | What it proves |
+|---|---|---|---|
+| **V1 (this doc)** | Directional ES single-instrument | 1.5–2.5 | Predictive quality of the feature + label + model stack; trade-management discipline |
+| **V2** | Same per-instrument directional model replicated on NQ, RTY, YM (4 independent equity-index books); optional correlation-aware book sizing | 1.8–2.8 | Model architecture transfers beyond ES; simple diversification gain |
+| **V3** | **Arbitrage / dollar-neutral structures**: index basis (ES vs SPY/sector basket), sector rotation long-short with ES hedge, pair trades on index family | 2.5–3.5 | Vol reduction from dollar-neutral construction; Sharpe lift from removing market beta |
+| **V4** | Full Book A (30-contract per-instrument cross-asset) + Book B (Treasury flies, crush, crack, SOFR packs, WTI-Brent) per [`DESIGN.md`](DESIGN.md) | 3–4 combined | Full diversified book; production scale |
 
-**Phase 4**: add Book B spreads.
+Each step is a go/no-go decision: if V1 lands at <1.0 net Sharpe, we diagnose before adding V2 complexity; if V3's arbitrage layer doesn't add Sharpe net of execution complexity, we stay at V2.
