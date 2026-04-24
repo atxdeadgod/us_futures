@@ -25,7 +25,13 @@ conda activate bhft
 
 START_YEAR="${START_YEAR:-2020}"
 END_YEAR="${END_YEAR:-2025}"
-TICKERS="${TICKERS:-SPX,SPXW,SPY}"
+# Broadened from SPX-only to full equity-index options universe for V1+V2:
+#   ES → SPX, SPY
+#   NQ → NDX, QQQ
+#   RTY → RUT, IWM
+#   YM → DJX, DIA
+# (SPXW returned empty last run — SPX secid already covers weeklies/0DTE; dropped.)
+TICKERS="${TICKERS:-SPX,SPY,NDX,QQQ,RUT,IWM,DJX,DIA}"
 
 python3 -u "$HOME/us_futures/scripts/wrds_spx_chain_download.py" \
     --start-year "$START_YEAR" \
