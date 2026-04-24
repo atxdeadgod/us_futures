@@ -81,7 +81,7 @@ def test_upper_barrier_hit_first():
     low = np.array([99.5, 100.0, 100.5, 101.5, 102.5, 103.5])
     open_ = close.copy()
     atr = np.array([1.0] * 6)
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=5
     )
     # From i=0: upper=101.5, lower=98.5. high[2]=101.5 hits upper first.
@@ -97,7 +97,7 @@ def test_lower_barrier_hit_first():
     low = np.array([99.5, 99.0, 98.5, 97.5, 96.5, 95.5])
     open_ = close.copy()
     atr = np.array([1.0] * 6)
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=5
     )
     # From i=0: upper=101.5, lower=98.5. low[2]=98.5 hits lower first.
@@ -113,7 +113,7 @@ def test_time_expired_zero_label():
     low = np.array([99.9] * 10)
     open_ = close.copy()
     atr = np.array([1.0] * 10)
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=2.0, k_dn=2.0, T=4
     )
     # Barriers at ±2.0; market stays in ±0.1. Time-expired → label 0, offset=4
@@ -129,7 +129,7 @@ def test_within_bar_ambiguity_up_close():
     low = np.array([99.5, 98.0])  # hits lower 98.5
     open_ = np.array([100.0, 99.0])  # open < close at bar 1 → upward bar
     atr = np.array([1.0, 1.0])
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=3
     )
     # From i=0: both barriers hit at j=1. close[1]=102 > open[1]=99 → +1
@@ -144,7 +144,7 @@ def test_within_bar_ambiguity_down_close():
     low = np.array([99.5, 98.0])  # hits lower 98.5
     open_ = np.array([100.0, 102.0])  # open > close at bar 1 → downward bar
     atr = np.array([1.0, 1.0])
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=3
     )
     assert labels[0] == -1
@@ -158,7 +158,7 @@ def test_nan_atr_gives_zero_label():
     low = np.array([99.5, 100.5, 101.5])
     open_ = close.copy()
     atr = np.array([np.nan, 1.0, 1.0])
-    labels, offsets, rets = _triple_barrier_np(
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=2
     )
     assert labels[0] == 0
@@ -174,14 +174,28 @@ def test_triple_barrier_labels_schema():
     """Output DataFrame has expected columns & dtypes."""
     bars = _mk_bars([100.0 + 0.1 * i for i in range(40)])
     out = triple_barrier_labels(bars, k_up=1.0, k_dn=1.0, T=5, atr_window=5)
-    assert "atr" in out.columns
-    assert "label" in out.columns
-    assert "hit_offset" in out.columns
-    assert "realized_ret" in out.columns
+    for c in ("atr", "label", "hit_offset", "realized_ret", "realized_ret_pts"):
+        assert c in out.columns
     assert out.schema["label"] == pl.Int8
     assert out.schema["hit_offset"] == pl.Int32
     assert out.schema["realized_ret"] == pl.Float64
+    assert out.schema["realized_ret_pts"] == pl.Float64
     assert out.height == bars.height
+
+
+def test_realized_ret_pts_matches_barrier_distance():
+    """For +1 label, realized_ret_pts = upper − close[i] = k_up * atr[i]."""
+    close = np.array([100.0, 100.5, 101.0, 102.0, 103.0])
+    high = np.array([100.5, 101.0, 101.5, 102.5, 103.5])
+    low = np.array([99.5, 100.0, 100.5, 101.5, 102.5])
+    open_ = close.copy()
+    atr = np.array([1.0] * 5)
+    labels, _, _, rets_pts = _triple_barrier_np(
+        close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=4
+    )
+    # i=0: +1 label; upper=101.5 → rets_pts = 101.5 - 100.0 = 1.5 = k_up*atr
+    assert labels[0] == 1
+    assert abs(rets_pts[0] - 1.5) < 1e-9
 
 
 def test_triple_barrier_labels_upward_drift():
@@ -246,6 +260,9 @@ def test_tune_triple_barrier_row_count():
         "k_up", "k_dn", "T", "atr_window",
         "frac_pos", "frac_neg", "frac_zero",
         "mean_ret_pos", "mean_ret_neg", "mean_ret_zero",
+        "mean_ret_pts_pos", "mean_ret_pts_neg", "mean_ret_pts_zero",
+        "mean_ret_bps_pos", "mean_ret_bps_neg", "mean_ret_bps_zero",
+        "pts_over_cost_pos", "pts_over_cost_neg",
         "mean_hit_offset_pos", "mean_hit_offset_neg", "mean_hit_offset_zero",
         "n_total", "label_forward_return_corr", "balance_score",
     }
@@ -263,6 +280,29 @@ def test_tune_triple_barrier_fractions_sum_to_one():
     )
     row = out.row(0, named=True)
     assert abs(row["frac_pos"] + row["frac_neg"] + row["frac_zero"] - 1.0) < 1e-9
+
+
+def test_tune_triple_barrier_pts_over_cost():
+    """pts_over_cost = |mean_pts| / cost_pts. Pass cost=1.0, check scaling."""
+    n = 120
+    rng = np.random.default_rng(3)
+    closes = (100.0 + rng.normal(0.0, 0.3, n).cumsum()).tolist()
+    bars = _mk_bars(closes, highs=[c + 0.3 for c in closes], lows=[c - 0.3 for c in closes])
+    out_c1 = tune_triple_barrier(
+        bars, k_up_grid=(1.0,), k_dn_grid=(1.0,), T_grid=(8,), atr_window_grid=(10,),
+        cost_pts=1.0,
+    )
+    out_c2 = tune_triple_barrier(
+        bars, k_up_grid=(1.0,), k_dn_grid=(1.0,), T_grid=(8,), atr_window_grid=(10,),
+        cost_pts=2.0,
+    )
+    r1 = out_c1.row(0, named=True)
+    r2 = out_c2.row(0, named=True)
+    # Halving cost → doubling ratio
+    assert abs(r1["pts_over_cost_pos"] - 2 * r2["pts_over_cost_pos"]) < 1e-9
+    # Ratio always non-negative
+    assert r1["pts_over_cost_pos"] >= 0
+    assert r1["pts_over_cost_neg"] >= 0
 
 
 def test_tune_triple_barrier_larger_T_higher_label_density():

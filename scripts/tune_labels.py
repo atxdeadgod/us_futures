@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from src.labels.triple_barrier import tune_triple_barrier
+from src.labels.triple_barrier import DEFAULT_COST_PTS, tune_triple_barrier
 
 
 DEFAULT_K_UP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5)
@@ -86,6 +86,9 @@ def main() -> int:
                    help="Comma-separated ints; overrides default 4,6,8,12,16,24")
     p.add_argument("--atr-window-grid", default=None,
                    help="Comma-separated ints; overrides default 20,40,60")
+    p.add_argument("--cost-pts", type=float, default=None,
+                   help="Round-trip cost in price pts (spread+commission+slippage). "
+                        "Defaults to DEFAULT_COST_PTS[instrument] (ES:0.50 NQ:1.50 RTY:0.30 YM:3.00).")
     args = p.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -103,7 +106,8 @@ def main() -> int:
         _parse_int_list(args.atr_window_grid) if args.atr_window_grid else DEFAULT_ATR_WINDOW_GRID
     )
     n_combos = len(k_up_grid) * len(k_dn_grid) * len(T_grid) * len(atr_window_grid)
-    print(f"[tune] {args.instrument}: grid size {n_combos} combos")
+    cost_pts = args.cost_pts if args.cost_pts is not None else DEFAULT_COST_PTS[args.instrument]
+    print(f"[tune] {args.instrument}: grid size {n_combos} combos, cost_pts={cost_pts}")
 
     bars = _load_bars(args.bars_glob, start, end)
 
@@ -113,6 +117,7 @@ def main() -> int:
         k_dn_grid=k_dn_grid,
         T_grid=T_grid,
         atr_window_grid=atr_window_grid,
+        cost_pts=cost_pts,
     )
     results = results.with_columns(pl.lit(args.instrument).alias("instrument"))
 
@@ -135,7 +140,10 @@ def main() -> int:
     print(ranked.select([
         "instrument", "k_up", "k_dn", "T", "atr_window",
         "frac_pos", "frac_neg", "frac_zero",
-        "balance_score", "label_forward_return_corr", "n_total",
+        "balance_score", "label_forward_return_corr",
+        "mean_ret_pts_pos", "mean_ret_pts_neg",
+        "pts_over_cost_pos", "pts_over_cost_neg",
+        "n_total",
     ]))
     return 0
 

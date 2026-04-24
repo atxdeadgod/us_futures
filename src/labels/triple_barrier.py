@@ -55,17 +55,20 @@ def _triple_barrier_np(
     k_up: float,
     k_dn: float,
     T: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (labels, hit_bar_offset, realized_return).
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (labels, hit_bar_offset, realized_log_return, realized_ret_pts).
 
     hit_bar_offset: bars from label_row until barrier hit (or T if time-expired).
-    realized_return: log-return from close[i] to hit price (exact barrier price for
-        ±1 labels; close[i+T] for 0 labels).
+    realized_log_return: log(barrier_price / close[i]) for ±1; log(close[i+T]/close[i]) for 0.
+    realized_ret_pts: absolute price diff (barrier_price − close[i]) in instrument
+        price units — i.e., ES points, NQ points, etc. Used downstream to evaluate
+        whether a vol-scaled barrier is tradeable after costs.
     """
     n = len(close)
     labels = np.zeros(n, dtype=np.int8)
     offsets = np.zeros(n, dtype=np.int32)
     rets = np.full(n, np.nan, dtype=np.float64)
+    rets_pts = np.full(n, np.nan, dtype=np.float64)
 
     for i in range(n):
         if np.isnan(atr[i]):
@@ -92,26 +95,31 @@ def _triple_barrier_np(
                 labels[i] = 0
                 offsets[i] = j_max - 1 - i
                 rets[i] = np.log(close[j_max - 1] / close[i])
+                rets_pts[i] = close[j_max - 1] - close[i]
             continue
 
         if hit_up != -1 and hit_dn == -1:
             labels[i] = 1
             offsets[i] = hit_up - i
             rets[i] = np.log(upper / close[i])
+            rets_pts[i] = upper - close[i]
         elif hit_dn != -1 and hit_up == -1:
             labels[i] = -1
             offsets[i] = hit_dn - i
             rets[i] = np.log(lower / close[i])
+            rets_pts[i] = lower - close[i]
         else:
             # Both hit — same bar or different bars
             if hit_up < hit_dn:
                 labels[i] = 1
                 offsets[i] = hit_up - i
                 rets[i] = np.log(upper / close[i])
+                rets_pts[i] = upper - close[i]
             elif hit_dn < hit_up:
                 labels[i] = -1
                 offsets[i] = hit_dn - i
                 rets[i] = np.log(lower / close[i])
+                rets_pts[i] = lower - close[i]
             else:
                 # Same bar j: use open-vs-close direction
                 j = hit_up
@@ -119,11 +127,13 @@ def _triple_barrier_np(
                     labels[i] = 1
                     offsets[i] = j - i
                     rets[i] = np.log(upper / close[i])
+                    rets_pts[i] = upper - close[i]
                 else:
                     labels[i] = -1
                     offsets[i] = j - i
                     rets[i] = np.log(lower / close[i])
-    return labels, offsets, rets
+                    rets_pts[i] = lower - close[i]
+    return labels, offsets, rets, rets_pts
 
 
 def triple_barrier_labels(
@@ -140,7 +150,8 @@ def triple_barrier_labels(
     """Emit triple-barrier labels on a bar frame.
 
     Returns the original frame with appended columns:
-        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32), realized_ret (Float64).
+        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32),
+        realized_ret (Float64, log return), realized_ret_pts (Float64, price pts).
     """
     df = bars.with_columns(
         atr_column(pl.col(high_col), pl.col(low_col), pl.col(close_col), window=atr_window).alias("atr")
@@ -151,13 +162,16 @@ def triple_barrier_labels(
     open_ = df[open_col].to_numpy()
     atr = df["atr"].to_numpy()
 
-    labels, offsets, rets = _triple_barrier_np(close, high, low, open_, atr, k_up, k_dn, T)
+    labels, offsets, rets, rets_pts = _triple_barrier_np(
+        close, high, low, open_, atr, k_up, k_dn, T
+    )
 
     return df.with_columns(
         [
             pl.Series("label", labels, dtype=pl.Int8),
             pl.Series("hit_offset", offsets, dtype=pl.Int32),
             pl.Series("realized_ret", rets, dtype=pl.Float64),
+            pl.Series("realized_ret_pts", rets_pts, dtype=pl.Float64),
         ]
     )
 
@@ -175,15 +189,39 @@ class LabelStats:
     frac_pos: float
     frac_neg: float
     frac_zero: float
+    # Log returns per class (what the model's classifier head effectively targets)
     mean_ret_pos: float
     mean_ret_neg: float
     mean_ret_zero: float
+    # Absolute price diff per class (instrument price units, e.g. ES/NQ points)
+    mean_ret_pts_pos: float
+    mean_ret_pts_neg: float
+    mean_ret_pts_zero: float
+    # Same scaled to bps of entry price (regime-invariant tradeability metric)
+    mean_ret_bps_pos: float
+    mean_ret_bps_neg: float
+    mean_ret_bps_zero: float
+    # Tradeability ratio: mean |ret| in points / round-trip cost in points.
+    # > 2 → comfortably tradeable; ~ 1 → break-even at best; < 1 → economically dead.
+    pts_over_cost_pos: float
+    pts_over_cost_neg: float
     mean_hit_offset_pos: float
     mean_hit_offset_neg: float
     mean_hit_offset_zero: float
     n_total: int
-    label_forward_return_corr: float  # spearman-ish; here we use simple pearson label × fwd-return
+    label_forward_return_corr: float  # pearson label × fwd-return; sanity check
     balance_score: float  # 0..1, higher = more balanced class distribution
+
+
+# Default round-trip cost in contract price points (spread + commission + slippage).
+# Informed estimates for mid-liquid front-month futures at retail commission ~$0.85/RT.
+# Override via tune_triple_barrier(..., cost_pts=...) at call site per-instrument.
+DEFAULT_COST_PTS = {
+    "ES": 0.50,   # 1 tick spread (0.25) + ~0.25 pt slippage+commission
+    "NQ": 1.50,   # 1 tick spread (0.25) + wider slippage at higher price
+    "RTY": 0.30,  # tick 0.10
+    "YM": 3.00,   # tick 1.0
+}
 
 
 def _balance_score(p_pos: float, p_neg: float, p_zero: float) -> float:
@@ -206,6 +244,7 @@ def tune_triple_barrier(
     high_col: str = "high",
     low_col: str = "low",
     close_col: str = "close",
+    cost_pts: float = 0.5,
 ) -> pl.DataFrame:
     """Grid-search triple-barrier parameters on a bar frame.
 
@@ -250,6 +289,16 @@ def tune_triple_barrier(
                         sub = valid.filter(pl.col("label") == lbl)["realized_ret"]
                         return float(sub.mean()) if sub.len() > 0 else float("nan")
 
+                    def _mean_pts(lbl: int) -> float:
+                        sub = valid.filter(pl.col("label") == lbl)["realized_ret_pts"]
+                        return float(sub.mean()) if sub.len() > 0 else float("nan")
+
+                    def _mean_bps(lbl: int) -> float:
+                        sub = valid.filter(pl.col("label") == lbl).select(
+                            (pl.col("realized_ret_pts") / pl.col(close_col) * 10_000).alias("bps")
+                        )["bps"]
+                        return float(sub.mean()) if sub.len() > 0 else float("nan")
+
                     def _mean_offset(lbl: int) -> float:
                         sub = valid.filter(pl.col("label") == lbl)["hit_offset"]
                         return float(sub.mean()) if sub.len() > 0 else float("nan")
@@ -262,11 +311,19 @@ def tune_triple_barrier(
                     else:
                         corr = float("nan")
 
+                    pts_pos = _mean_pts(1)
+                    pts_neg = _mean_pts(-1)
                     rows.append(
                         LabelStats(
                             k_up=k_up, k_dn=k_dn, T=T, atr_window=atr_w,
                             frac_pos=frac_pos, frac_neg=frac_neg, frac_zero=frac_zero,
                             mean_ret_pos=_mean(1), mean_ret_neg=_mean(-1), mean_ret_zero=_mean(0),
+                            mean_ret_pts_pos=pts_pos, mean_ret_pts_neg=pts_neg,
+                            mean_ret_pts_zero=_mean_pts(0),
+                            mean_ret_bps_pos=_mean_bps(1), mean_ret_bps_neg=_mean_bps(-1),
+                            mean_ret_bps_zero=_mean_bps(0),
+                            pts_over_cost_pos=(abs(pts_pos) / cost_pts) if cost_pts > 0 and not np.isnan(pts_pos) else float("nan"),
+                            pts_over_cost_neg=(abs(pts_neg) / cost_pts) if cost_pts > 0 and not np.isnan(pts_neg) else float("nan"),
                             mean_hit_offset_pos=_mean_offset(1),
                             mean_hit_offset_neg=_mean_offset(-1),
                             mean_hit_offset_zero=_mean_offset(0),
