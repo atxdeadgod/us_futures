@@ -53,7 +53,12 @@ def s3_ls(bucket: str, prefix: str, request_pays: bool = True) -> list[tuple[str
            "--profile", PROFILE, "--query", "Contents[].[Key,Size]", "--output", "text"]
     if request_pays:
         cmd += ["--request-payer", "requester"]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
+    except subprocess.TimeoutExpired:
+        return []
+    except Exception:
+        return []
     if out.returncode != 0:
         return []
     files = []
@@ -185,14 +190,24 @@ def main() -> int:
     bytes_dl = 0
 
     def run_one(job: Job):
-        if job.dataset == "vix":
-            return job, process_vix(job, log)
-        return job, process_taq_or_depth(job, log)
+        """Per-job work wrapped so NO exception can kill the pool. A failing job
+        is counted as 'failed' and logged; the rest continue."""
+        try:
+            if job.dataset == "vix":
+                return job, process_vix(job, log)
+            return job, process_taq_or_depth(job, log)
+        except Exception as exc:
+            return job, {"status": f"exception: {type(exc).__name__}: {str(exc)[:200]}", "bytes": 0}
 
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futures = [ex.submit(run_one, j) for j in jobs]
         for i, fut in enumerate(as_completed(futures), 1):
-            job, result = fut.result()
+            try:
+                job, result = fut.result()
+            except Exception as exc:
+                log.warning(f"worker exception leaked past run_one: {exc}")
+                counts["failed"] += 1
+                continue
             if result["status"] == "downloaded":
                 counts["downloaded"] += 1
                 bytes_dl += result["bytes"]
