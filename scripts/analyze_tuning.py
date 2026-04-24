@@ -73,8 +73,9 @@ def _year_stats(
     cost_pts: float,
 ) -> dict:
     labeled = triple_barrier_labels(bars_year, k_up=k_up, k_dn=k_dn, T=T, atr_window=atr_window)
+    # is_finite() catches both null AND NaN; warmup rows + tail rows have NaN.
     valid = labeled.filter(
-        pl.col("atr").is_not_null() & pl.col("realized_ret").is_not_null()
+        pl.col("atr").is_finite() & pl.col("realized_ret").is_finite()
     )
     n = valid.height
     if n == 0:

@@ -282,6 +282,28 @@ def test_tune_triple_barrier_fractions_sum_to_one():
     assert abs(row["frac_pos"] + row["frac_neg"] + row["frac_zero"] - 1.0) < 1e-9
 
 
+def test_tune_triple_barrier_corr_finite_with_warmup_nans():
+    """Regression: warmup rows + tail rows leave realized_ret as NaN (not null).
+    Filter must use is_finite() so NaN rows don't poison .mean() and corrcoef."""
+    n = 80
+    rng = np.random.default_rng(99)
+    closes = (100.0 + rng.normal(0.0, 0.4, n).cumsum()).tolist()
+    bars = _mk_bars(closes, highs=[c + 0.3 for c in closes], lows=[c - 0.3 for c in closes])
+    out = tune_triple_barrier(
+        bars, k_up_grid=(1.0,), k_dn_grid=(1.0,), T_grid=(4,), atr_window_grid=(20,),
+    )
+    row = out.row(0, named=True)
+    # ATR window=20 → first 20 rows have NaN ATR → labels=0 ret=NaN → must be filtered.
+    # Last ~T rows can have NaN ret (j_max == i+1) → must also be filtered.
+    # If the filter is correct, corr is a real float (not NaN).
+    assert not np.isnan(row["label_forward_return_corr"]), \
+        "corr is NaN — likely is_not_null filter not catching NaN rows"
+    # mean_ret_pts_zero must also be a real number (zero-class is largest sample)
+    if row["frac_zero"] > 0:
+        assert not np.isnan(row["mean_ret_pts_zero"]), \
+            "mean_ret_pts_zero is NaN — NaN rows leaking into label=0 mean"
+
+
 def test_tune_triple_barrier_pts_over_cost():
     """pts_over_cost = |mean_pts| / cost_pts. Pass cost=1.0, check scaling."""
     n = 120

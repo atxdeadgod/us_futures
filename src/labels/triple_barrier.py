@@ -270,8 +270,10 @@ def tune_triple_barrier(
                         low_col=low_col,
                         close_col=close_col,
                     )
+                    # is_finite() catches both null AND NaN; the labeler emits NaN
+                    # (not null) for warmup rows + tail rows where j_max == i+1.
                     valid = labeled.filter(
-                        pl.col("atr").is_not_null() & pl.col("realized_ret").is_not_null()
+                        pl.col("atr").is_finite() & pl.col("realized_ret").is_finite()
                     )
                     n = valid.height
                     if n == 0:
