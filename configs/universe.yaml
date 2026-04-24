@@ -1,0 +1,79 @@
+# Trading universe — 30 liquid futures across 7 asset classes
+# All confirmed present in Algoseek MBP-10 depth data for 2020–2024
+# (2025 TAQ-only; depth may need 2025 extension when live)
+
+asset_classes:
+
+  equity_index:
+    description: "Major US equity index futures; core of Book A equity slice"
+    contracts:
+      - {root: ES,  exchange: CME,   name: "E-mini S&P 500"}
+      - {root: NQ,  exchange: CME,   name: "E-mini Nasdaq-100"}
+      - {root: RTY, exchange: CME,   name: "E-mini Russell 2000"}
+      - {root: YM,  exchange: CBOT,  name: "E-mini Dow"}
+
+  rates:
+    description: "US Treasury curve; backbone of Book B flies (FYT, NOB, 2-5-10, 5-10-30)"
+    contracts:
+      - {root: ZT, exchange: CBOT, name: "2Y T-Note"}
+      - {root: ZF, exchange: CBOT, name: "5Y T-Note"}
+      - {root: ZN, exchange: CBOT, name: "10Y T-Note"}
+      - {root: TN, exchange: CBOT, name: "Ultra 10Y T-Note"}
+      - {root: ZB, exchange: CBOT, name: "30Y T-Bond"}
+
+  energy:
+    description: "Crude complex + nat gas; Book B crack spread (CL-RB-HO) and CL-BZ"
+    contracts:
+      - {root: CL, exchange: NYMEX, name: "WTI Crude"}
+      - {root: BZ, exchange: NYMEX, name: "Brent Crude (financial)"}
+      - {root: NG, exchange: NYMEX, name: "Henry Hub Natural Gas"}
+      - {root: HO, exchange: NYMEX, name: "Heating Oil / ULSD"}
+      - {root: RB, exchange: NYMEX, name: "RBOB Gasoline"}
+
+  metals:
+    description: "Precious + base; GC-SI ratio, HG as industrial activity proxy"
+    contracts:
+      - {root: GC, exchange: COMEX, name: "Gold"}
+      - {root: SI, exchange: COMEX, name: "Silver"}
+      - {root: HG, exchange: COMEX, name: "Copper"}
+      - {root: PA, exchange: NYMEX, name: "Palladium"}
+      - {root: PL, exchange: NYMEX, name: "Platinum"}
+
+  agricultural:
+    description: "Grains; full crush complex (ZS-ZM-ZL) for Book B"
+    contracts:
+      - {root: ZC, exchange: CBOT, name: "Corn"}
+      - {root: ZS, exchange: CBOT, name: "Soybeans"}
+      - {root: ZW, exchange: CBOT, name: "Wheat (Chicago SRW)"}
+      - {root: ZM, exchange: CBOT, name: "Soybean Meal"}
+      - {root: ZL, exchange: CBOT, name: "Soybean Oil"}
+
+  fx:
+    description: "Major FX pairs vs USD"
+    contracts:
+      - {root: 6E, exchange: CME, name: "EUR/USD"}
+      - {root: 6J, exchange: CME, name: "JPY/USD"}
+      - {root: 6B, exchange: CME, name: "GBP/USD"}
+      - {root: 6A, exchange: CME, name: "AUD/USD"}
+      - {root: 6C, exchange: CME, name: "CAD/USD"}
+
+  stir:
+    description: "Short-term interest rates; Book B SOFR pack butterflies"
+    contracts:
+      - {root: SR3, exchange: CME, name: "3-Month SOFR"}
+
+# ---------------------------------------------------------------
+# Deliberately excluded (and why):
+#   - MES, MNQ, MYM, M2K, M6E, M6B, M6A, MCD  : micros redundant with full-size for signal research
+#   - BTC                                     : different regime; warrants separate effort
+#   - HE, LE, GF                              : livestock, thin microstructure
+#   - SR1                                     : redundant with SR3 for STIR signals
+#   - ES-NQ-YM-RTY pairs                      : not structural, pure risk-on/off beta
+# ---------------------------------------------------------------
+
+summary:
+  total_contracts: 30
+  total_asset_classes: 7
+  primary_exchange: CME Group (CME/CBOT/NYMEX/COMEX)
+  data_source: Algoseek MBP-10 depth + TAQ v2
+  coverage: "2020-01-02 through 2025-08-25 (TAQ); 2020-01-02 through 2024-12-31 (depth)"

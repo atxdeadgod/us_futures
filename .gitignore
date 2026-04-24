@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Data (never commit)
+data/
+*.parquet
+*.csv.gz
+*.h5
+*.feather
+features_v*/
+cache/
+
+# Results / logs
+*.log
+*.out
+*.err
+results/
+backtest_results/
+slurm/*.out
+slurm/*.err
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+.pgpass
+*.key
