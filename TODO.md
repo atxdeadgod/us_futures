@@ -161,7 +161,35 @@ feature library:
 Output: per-trading-instrument feature panel parquet with both single and
 cross-asset features. Then IC dashboard + ILP feature selection.
 
-## Post-VIX work (after Track 0 finishes)
+## VIX data — BLOCKED for V1 (2026-04-25 investigation)
+
+VIX data is currently inaccessible. Investigation:
+
+- **Original `s3://vix-futures/` bucket**: list works, but
+  `HeadObject`/`GetObject` returns 403 Forbidden using the `plt-de-dev` AWS
+  profile (despite `--request-payer requester`). Bucket-level permissions
+  barrier on individual objects.
+- **Mirror at `s3://plt-de-dev/lake/US/raw/Algoseek/s3/vix-futures/`**: list
+  works; every VIX object has `StorageClass = GLACIER`. `GetObject` fails
+  with `InvalidObjectState`. `aws s3 cp` skips with explicit message:
+  "Object is of storage class GLACIER. Unable to perform download operations
+  on GLACIER objects. You must restore the object."
+
+To unblock VIX in the future:
+- **Option 1**: issue `aws s3api restore-object` requests on the mirror,
+  Bulk tier (5-12h per object). ~$0.0025/request × ~15,600 files (6 yrs ×
+  260 days × ~10 expiries) = ~$40 in requests + temporary restore storage
+  (~$2/GB·month). Total ~$50-100 for the full 6-year curve.
+- **Option 2**: obtain IAM credentials with direct `GetObject` on
+  `s3://vix-futures/` (verify with the data-platform team whether a profile
+  with these permissions exists). Bypasses the Glacier issue if the source
+  bucket files are in Standard storage.
+
+V1 ships without VX features. The panel.py architecture already supports
+slotting VX features in once the data is unblocked — only the VX bar
+builder + VX panel module need to be added (see "Post-VIX work" below).
+
+## Post-VIX work (when VIX data is unblocked)
 
 - **VX bar builder** — VX raw TAQ → 15-min bars for VX1, VX2, VX3 (front-three
   monthly contracts). Mirrors `bars_5sec` + `bars_downsample` + roll handling.
@@ -170,8 +198,8 @@ cross-asset features. Then IC dashboard + ILP feature selection.
   to emit term-structure features (calendar spread, ratio, curvature,
   spread z-score, VX-mid z-score, vx-OFI-weighted).
 - **Attach VX features to ES bars**: VX trades on a different exchange (CFE)
-  with overlapping but not identical session hours. Use `engines.asof_strict_backward`
-  to attach the most recent VX bar to each ES bar.
+  with overlapping but not identical session hours. Use
+  `engines.asof_strict_backward` to attach the most recent VX bar to each ES bar.
 
 ## Post-build cleanup (after V1 panel.py works end-to-end)
 
@@ -261,3 +289,6 @@ model more durable against regime change.
 While bars build, develop `src/features/cross_asset_macro.py` (TC + MAD +
 quantile rank + Gauss-Rank + composites) and `src/features/panel.py`
 (orchestrator) so they're ready when bars finish.
+
+
+- Also I have a suspicion that the  GEX features might not be useful on its own rather we should use it as an indicator variable ; perhaps multiply it with correct features to make it more useful. 
