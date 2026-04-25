@@ -25,6 +25,10 @@ V1 approximation (this module):
 Output columns (attached to 5-sec bar schema):
     net_bid_decrement_no_trade_L1
     net_ask_decrement_no_trade_L1
+    bid_sz_L1_delta_signed         (last - first; T1.28 prereq)
+    ask_sz_L1_delta_signed         (last - first; T1.28 prereq)
+    hit_bid_vol                    (sell-aggressor volume; T1.28 normalizer)
+    lift_ask_vol                   (buy-aggressor volume; T1.28 normalizer)
 """
 from __future__ import annotations
 
@@ -112,8 +116,18 @@ def cancel_proxy_bars(
                     pl.lit(0, dtype=pl.Int64),
                     pl.col("ask_sz_L1_first") - pl.col("ask_sz_L1_last") - pl.col("lift_ask_vol"),
                 ).alias("net_ask_decrement_no_trade_L1"),
+                # T1.28: signed depth deltas (last - first) per bar; combined with
+                # aggressor-side volume downstream gives "side-conditioned liquidity
+                # response". Positive = depth grew within bar; negative = depth shrank.
+                (pl.col("bid_sz_L1_last") - pl.col("bid_sz_L1_first")).alias("bid_sz_L1_delta_signed"),
+                (pl.col("ask_sz_L1_last") - pl.col("ask_sz_L1_first")).alias("ask_sz_L1_delta_signed"),
             ]
         )
-        .select(["ts", "net_bid_decrement_no_trade_L1", "net_ask_decrement_no_trade_L1"])
+        .select([
+            "ts",
+            "net_bid_decrement_no_trade_L1", "net_ask_decrement_no_trade_L1",
+            "bid_sz_L1_delta_signed", "ask_sz_L1_delta_signed",
+            "hit_bid_vol", "lift_ask_vol",
+        ])
     )
     return out

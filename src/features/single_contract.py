@@ -340,6 +340,20 @@ def attach_l2_deep_features(
         if k <= 5:
             aggs.append(l2_features.order_count_imbalance_at(k=k).alias(f"order_count_imbalance_L{k}"))
             aggs.append(l2_features.order_size_imbalance_at(k=k).alias(f"order_size_imbalance_L{k}"))
+
+    # T1.29 — Liquidity migration: bar-to-bar size deltas across levels.
+    # Positive bid_migration_L1_to_L2 = liquidity moved from L1 to L2 (queue
+    # got deeper, less aggressive); positive ask_migration_L1_to_L2 = same
+    # on the ask side. L1_to_L3 covers wider migrations.
+    for side in ("bid", "ask"):
+        for to_level in (2, 3):
+            sz_l1 = pl.col(f"{side}_sz_L1")
+            sz_lk = pl.col(f"{side}_sz_L{to_level}")
+            d1 = sz_l1 - sz_l1.shift(1)  # bar-to-bar Δ at L1
+            dk = sz_lk - sz_lk.shift(1)  # bar-to-bar Δ at L{k}
+            # Migration L1→Lk: positive = L1 lost AND Lk gained (queue migrated deeper)
+            aggs.append((-d1 + dk).alias(f"{side}_migration_L1_to_L{to_level}"))
+
     return bars.with_columns(aggs)
 
 
@@ -521,6 +535,35 @@ def attach_phase_e_features(
         derived.append(
             (pl.col("quote_update_count") / (pl.col("trades_count") + EPS))
                 .alias("quote_to_trade_ratio")
+        )
+
+    # T1.25 — quote_movement_directionality: ((bid_up + ask_down) - (bid_down + ask_up))
+    # / total_directional_events. Positive = price-improving regime.
+    direction_cols = {"bid_up_count", "bid_down_count", "ask_up_count", "ask_down_count"}
+    if direction_cols.issubset(pe_cols):
+        total_dir = (
+            pl.col("bid_up_count") + pl.col("bid_down_count")
+            + pl.col("ask_up_count") + pl.col("ask_down_count")
+        )
+        improving = pl.col("bid_up_count") + pl.col("ask_down_count")
+        worsening = pl.col("bid_down_count") + pl.col("ask_up_count")
+        derived.append(
+            ((improving - worsening) / (total_dir + EPS)).alias("quote_movement_directionality")
+        )
+
+    # T1.28 — side_conditioned_liquidity_shift: depth response normalized by
+    # aggressor flow. ask_resilience_buy_aggr > 0 = ask depth refilled more than
+    # buy aggressors removed (LP defending the level); < 0 = ask further depleted
+    # beyond what trades took (LP retreating). Symmetric on bid side for sells.
+    if {"ask_sz_L1_delta_signed", "lift_ask_vol"}.issubset(pe_cols):
+        derived.append(
+            ((pl.col("ask_sz_L1_delta_signed") + pl.col("lift_ask_vol"))
+             / (pl.col("lift_ask_vol") + EPS)).alias("side_cond_ask_resilience_buy")
+        )
+    if {"bid_sz_L1_delta_signed", "hit_bid_vol"}.issubset(pe_cols):
+        derived.append(
+            ((pl.col("bid_sz_L1_delta_signed") + pl.col("hit_bid_vol"))
+             / (pl.col("hit_bid_vol") + EPS)).alias("side_cond_bid_resilience_sell")
         )
 
     bars = bars.with_columns(derived)

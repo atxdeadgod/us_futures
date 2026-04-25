@@ -39,7 +39,12 @@ if str(REPO) not in sys.path:
 
 from src.data.bars_5sec import BAR_EVERY
 from src.data.bars_cancel import cancel_proxy_bars
-from src.data.bars_exec import effective_spread_bars, hidden_absorption_bars, large_trade_bars
+from src.data.bars_exec import (
+    effective_spread_bars,
+    hidden_absorption_bars,
+    large_trade_bars,
+    quote_direction_bars,
+)
 from src.data.ingest import locate, read_depth, read_taq, split_trades_quotes
 from src.data.roll import iter_front_series
 
@@ -55,7 +60,15 @@ _PHASE_E_AGG_RULES: dict[str, str] = {
     "n_large_trades": "sum", "large_trade_volume": "sum",
     "hidden_absorption_volume": "sum", "hidden_absorption_trades": "sum",
     "net_bid_decrement_no_trade_L1": "sum", "net_ask_decrement_no_trade_L1": "sum",
+    # T1.28 side-conditioned cancel-proxy extensions
+    "bid_sz_L1_delta_signed": "sum",  # signed bar deltas; sum of 5s deltas = full-bar delta
+    "ask_sz_L1_delta_signed": "sum",
+    "hit_bid_vol": "sum",  # sell-aggressor volume
+    "lift_ask_vol": "sum",  # buy-aggressor volume
     "quote_update_count": "sum",
+    # T1.25 quote-direction event counts
+    "bid_up_count": "sum", "bid_down_count": "sum",
+    "ask_up_count": "sum", "ask_down_count": "sum",
 }
 
 
@@ -116,12 +129,14 @@ def build_day(
     hidden = hidden_absorption_bars(trades, depth, every=BAR_EVERY, only_regular=True)
     cancel = cancel_proxy_bars(trades, depth, every=BAR_EVERY, only_regular=True)
     qcount = _quote_event_count_bars(quotes, every=BAR_EVERY)
+    qdir = quote_direction_bars(quotes, every=BAR_EVERY)
 
-    # Outer-join all five frames on ts (5-sec resolution).
+    # Outer-join all six frames on ts (5-sec resolution).
     bars_5s = eff.join(large, on="ts", how="full", coalesce=True)
     bars_5s = bars_5s.join(hidden, on="ts", how="full", coalesce=True)
     bars_5s = bars_5s.join(cancel, on="ts", how="full", coalesce=True)
-    bars_5s = bars_5s.join(qcount, on="ts", how="full", coalesce=True).sort("ts")
+    bars_5s = bars_5s.join(qcount, on="ts", how="full", coalesce=True)
+    bars_5s = bars_5s.join(qdir, on="ts", how="full", coalesce=True).sort("ts")
 
     # Fill nulls (bars with no event of that kind get 0).
     for col in bars_5s.columns:

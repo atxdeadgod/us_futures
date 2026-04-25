@@ -16,6 +16,7 @@ from src.data.bars_exec import (
     effective_spread_bars,
     hidden_absorption_bars,
     large_trade_bars,
+    quote_direction_bars,
 )
 
 
@@ -279,3 +280,47 @@ def test_hidden_absorption_price_mismatch():
     bars = hidden_absorption_bars(trades, depth)
     r = bars.row(0, named=True)
     assert r["hidden_absorption_volume"] == 0
+
+
+# ===========================================================================
+# T1.25  quote_direction_bars
+# ===========================================================================
+
+def test_quote_direction_bars_emits_expected_schema():
+    t0 = datetime(2024, 1, 2, 14, 30, 0, tzinfo=timezone.utc)
+    quotes = _mk_quotes([
+        {"ts": t0 + timedelta(milliseconds=100), "side": "bid", "price": 5000.00,
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=200), "side": "bid", "price": 5000.25,
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=300), "side": "ask", "price": 5000.50,
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=400), "side": "ask", "price": 5000.25,
+         "size": 10, "orders": 1, "is_implied": False},
+    ])
+    bars = quote_direction_bars(quotes)
+    for c in ("bid_up_count", "bid_down_count", "ask_up_count", "ask_down_count"):
+        assert c in bars.columns
+
+
+def test_quote_direction_counts_correct():
+    """Bid moved up once, ask moved down once → check counts."""
+    t0 = datetime(2024, 1, 2, 14, 30, 0, tzinfo=timezone.utc)
+    quotes = _mk_quotes([
+        {"ts": t0 + timedelta(milliseconds=100), "side": "bid", "price": 5000.00,
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=200), "side": "bid", "price": 5000.25,  # up
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=300), "side": "bid", "price": 5000.00,  # down
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=400), "side": "ask", "price": 5000.50,
+         "size": 10, "orders": 1, "is_implied": False},
+        {"ts": t0 + timedelta(milliseconds=500), "side": "ask", "price": 5000.25,  # down
+         "size": 10, "orders": 1, "is_implied": False},
+    ])
+    bars = quote_direction_bars(quotes)
+    r = bars.row(0, named=True)
+    assert r["bid_up_count"] == 1
+    assert r["bid_down_count"] == 1
+    assert r["ask_up_count"] == 0
+    assert r["ask_down_count"] == 1

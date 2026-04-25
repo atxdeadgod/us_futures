@@ -482,7 +482,15 @@ def _mk_phase_e_bars(n_bars: int = 96, seed: int = 7) -> pl.DataFrame:
             hidden_absorption_trades=int(abs(rng.normal(2, 1))),
             net_bid_decrement_no_trade_L1=int(abs(rng.normal(15, 5))),
             net_ask_decrement_no_trade_L1=int(abs(rng.normal(15, 5))),
+            bid_sz_L1_delta_signed=int(rng.normal(0, 5)),
+            ask_sz_L1_delta_signed=int(rng.normal(0, 5)),
+            hit_bid_vol=max(1, int(rng.normal(50, 10))),
+            lift_ask_vol=max(1, int(rng.normal(50, 10))),
             quote_update_count=int(rng.normal(400, 80)),
+            bid_up_count=int(rng.normal(20, 5)),
+            bid_down_count=int(rng.normal(20, 5)),
+            ask_up_count=int(rng.normal(20, 5)),
+            ask_down_count=int(rng.normal(20, 5)),
         ))
     return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
 
@@ -497,9 +505,30 @@ def test_attach_phase_e_features_emits_expected_columns():
         "large_trade_volume_share", "n_large_trades_log",
         "cancel_to_trade_ratio", "quote_to_trade_ratio",
         "hidden_absorption_ratio_w30",
+        # T1.25 + T1.28 (Phase F additions)
+        "quote_movement_directionality",
+        "side_cond_ask_resilience_buy", "side_cond_bid_resilience_sell",
     ]
     for c in expected:
         assert c in out.columns, f"missing Phase E col: {c}"
+
+
+def test_attach_phase_e_features_quote_directionality_in_unit_interval():
+    """T1.25 quote_movement_directionality ∈ [-1, 1]."""
+    bars = _mk_phase_a_bars(n_days=2)
+    pe = _mk_phase_e_bars(n_bars=192)
+    out = panel.attach_phase_e_features(bars, pe)
+    valid = out["quote_movement_directionality"].drop_nulls().to_list()
+    assert all(-1.0 - 1e-9 <= v <= 1.0 + 1e-9 for v in valid)
+
+
+def test_attach_l2_deep_features_emits_liquidity_migration():
+    """T1.29: bid/ask migration L1→L2 and L1→L3."""
+    bars = _mk_phase_b_bars(n_bars=80, depth=10)
+    out = panel.attach_l2_deep_features(bars, depth=10, spread_z_window=20)
+    for side in ("bid", "ask"):
+        for to_lvl in (2, 3):
+            assert f"{side}_migration_L1_to_L{to_lvl}" in out.columns
 
 
 def test_attach_phase_e_features_handles_ts_dtype_mismatch():

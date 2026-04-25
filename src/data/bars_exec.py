@@ -1,13 +1,14 @@
 """5-sec bar Phase C: execution-quality aggregates.
 
 Emits per-bar execution-derived features for Tier-1 microstructure (T1.35-T1.37,
-T1.23, T1.47). Each function takes raw trades/quotes/depth streams and returns
-a DataFrame keyed by bar-close `ts`, ready to join onto Phase A bars.
+T1.23, T1.47, T1.25). Each function takes raw trades/quotes/depth streams and
+returns a DataFrame keyed by bar-close `ts`, ready to join onto Phase A bars.
 
 Functions:
-  effective_spread_bars   — T1.35, T1.36, T1.37 aggregates
-  large_trade_bars        — T1.23 (top-k% of session trade sizes)
-  hidden_absorption_bars  — T1.47 (aggressor exceeded L1 size, no price tick)
+  effective_spread_bars     — T1.35, T1.36, T1.37 aggregates
+  large_trade_bars          — T1.23 (top-k% of session trade sizes)
+  hidden_absorption_bars    — T1.47 (aggressor exceeded L1 size, no price tick)
+  quote_direction_bars      — T1.25 prerequisite (per-quote price-move direction counts)
 
 Deferred to Phase D (separate module):
   cancel_proxy_bars       — MBP-10 snapshot-delta cancel attribution (§8.M)
@@ -182,3 +183,52 @@ def hidden_absorption_bars(
         )
     )
     return bars
+
+
+# ---------------------------------------------------------------------------
+# T1.25 — Quote-movement directionality (per-bar event-direction counts)
+# ---------------------------------------------------------------------------
+
+def quote_direction_bars(
+    quotes: pl.DataFrame, every: str = BAR_EVERY,
+) -> pl.DataFrame:
+    """Per-bar counts of quote-update direction events (per side).
+
+    For each side (bid/ask), classify each quote update by comparing its
+    price to the previous quote on the same side:
+        up   → price strictly higher than prev
+        down → price strictly lower than prev
+        flat → unchanged or first-of-side
+
+    Returns: ts, bid_up_count, bid_down_count, ask_up_count, ask_down_count.
+
+    Downstream T1.25 quote_movement_directionality computes:
+        ((bid_up + ask_down) − (bid_down + ask_up)) / total_directional_events
+    Range [-1, 1]: positive = price-improving regime (bid up + ask down).
+    """
+    bid = (
+        quotes.filter(pl.col("side") == "bid")
+        .sort("ts")
+        .with_columns(pl.col("price").diff().sign().alias("_dir"))
+    )
+    ask = (
+        quotes.filter(pl.col("side") == "ask")
+        .sort("ts")
+        .with_columns(pl.col("price").diff().sign().alias("_dir"))
+    )
+
+    bid_bars = (
+        bid.group_by_dynamic("ts", every=every, closed="left", label="right")
+        .agg([
+            (pl.col("_dir") == 1).cast(pl.Int64).sum().alias("bid_up_count"),
+            (pl.col("_dir") == -1).cast(pl.Int64).sum().alias("bid_down_count"),
+        ])
+    )
+    ask_bars = (
+        ask.group_by_dynamic("ts", every=every, closed="left", label="right")
+        .agg([
+            (pl.col("_dir") == 1).cast(pl.Int64).sum().alias("ask_up_count"),
+            (pl.col("_dir") == -1).cast(pl.Int64).sum().alias("ask_down_count"),
+        ])
+    )
+    return bid_bars.join(ask_bars, on="ts", how="full", coalesce=True).sort("ts")

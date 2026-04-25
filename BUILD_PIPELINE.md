@@ -121,12 +121,21 @@ input dependencies. SLURM array tasks are independent days × instruments.
 - **Script**: `scripts/build_5sec_bars.py`, `build_5sec_bars.sbatch`.
 - **Status**: ✅ done (1299 days for ES).
 
-### S4b. Phase E bars (ES, execution-quality + cancel-proxy + quote-event aggregates)
+### S4b. Phase E bars (ES, execution-quality + cancel-proxy + quote-event + quote-direction aggregates)
 - **Reads**: raw TAQ + depth (Algoseek).
-- **Writes**: `bars_phase_e/ES/15m/ES_{YYYYMMDD}_15m.parquet` (14 cols).
-- **Cols**: eff_spread_{sum,weight,count,buy_*,sell_*}, n_large_trades, large_trade_volume, hidden_absorption_{volume,trades}, net_{bid,ask}_decrement_no_trade_L1, quote_update_count.
-- **Used by**: `single_contract.attach_phase_e_features` to derive vwap_eff_spread + asymmetry (T1.35-T1.37), large_trade_volume_share (T1.23), hidden_absorption_ratio (T1.47/T7.12), cancel_to_trade_ratio (T1.43), quote_to_trade_ratio (T1.24).
+- **Writes**: `bars_phase_e/ES/15m/ES_{YYYYMMDD}_15m.parquet` (24 cols).
+- **Cols**:
+  - Effective spread: eff_spread_{sum,weight,count,buy_sum,buy_weight,sell_sum,sell_weight} (T1.35-T1.37 prereqs)
+  - Large trades: n_large_trades, large_trade_volume (T1.23 prereqs)
+  - Hidden absorption: hidden_absorption_{volume,trades} (T1.47/T7.12 prereqs)
+  - Cancel proxy: net_{bid,ask}_decrement_no_trade_L1 (T1.43 prereqs)
+  - **Side-conditioned shifts (T1.28 prereqs)**: bid_sz_L1_delta_signed, ask_sz_L1_delta_signed, hit_bid_vol, lift_ask_vol
+  - Quote count: quote_update_count (T1.24 prereq)
+  - **Quote direction (T1.25 prereqs)**: bid_up_count, bid_down_count, ask_up_count, ask_down_count
+- **Used by**: `single_contract.attach_phase_e_features` to derive: vwap_eff_spread + asymmetry (T1.35-T1.37), large_trade_volume_share (T1.23), hidden_absorption_ratio (T1.47/T7.12), cancel_to_trade_ratio (T1.43), quote_to_trade_ratio (T1.24), **quote_movement_directionality (T1.25)**, **side_cond_ask_resilience_buy / side_cond_bid_resilience_sell (T1.28)**.
 - **Script**: `scripts/build_phase_e_bars.py`, `build_phase_e_bars.sbatch`.
+
+  Note: T1.29 liquidity_migration is NOT in Phase E — it's derived directly from Phase A+B's L1-L5 cols via bar-to-bar deltas in `attach_l2_deep_features`.
 
 ### S5. GEX daily profile (SPX, SPY)
 - **Reads**: `spx_options_chain/{TICKER}_{YEAR}.parquet` (WRDS OptionMetrics).
