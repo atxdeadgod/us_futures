@@ -223,39 +223,77 @@ python -m pytest tests/ -q
 
 ---
 
-## Column inventory (post-VX, post-GEX, ~378 cols total)
+## V1 feature inventory (single-contract ES panel)
 
-| Group | Count | Source | Notes |
+The end-to-end smoke run on ES 2024 (commits through 5d41a1e + Phase F)
+produces **416 cols / 9,970 valid labeled rows** without Phase E and
+**~427 cols** once Phase E is wired in (see "Phase E status" below).
+
+### Column-group breakdown (per labeled bar)
+
+| Group | Count | Source | Tier coverage |
 |---|---:|---|---|
-| identity / labels | 10 | bar build + V1 labeling | ts, root, expiry, label, realized_ret, atr, halt_truncated, ... |
-| base micro | ~44 | `panel.attach_base_microstructure_features` | 34 BASE_VALUE_COLS + helpers (vwap_deviation, rolling vol/trade-count helpers) |
-| TC z-score normalizations | 68 | `panel.attach_ts_normalizations` | 34 BASE × {30, 60} day lookback |
-| MAD z-score normalizations | 68 | same | robust-to-outliers variant |
-| L2 deep (composite) | 10 | `panel.attach_l2_deep_features` | cum/dw imbalance, depth-weighted spread, HHI bid+ask, deep_ofi×2, spread_z |
-| L2 per-level | 40 | same | volume_imbalance/basic_spread/ofi_at L1..L10 + order_count/size_imbalance L1..L5 |
-| patterns (T7.*) | 13 | `panel.attach_pattern_features` | breakouts, reversals, CVD divergence, range compression, absorption, spike-fade |
-| engine | 4 | `panel.attach_engine_features` | fracdiff(d=0.4) + round_pin {N=10,25,50} |
-| EMA-smoothed | 16 | `src/features/smoothed.py` | 8 base × spans {10, 30} causal EMA |
-| session / cyclic / overnight | 11 | `tc_features` + `overnight` | hour_et + 4 session flags + sin/cos minute + 4 overnight |
-| VX | 7 | `panel.attach_vx_features` | vx1/2/3_mid, calendar_spread/ratio, term_curvature, vx1_zscore, vx_spread_z |
-| GEX | 5 | `panel.attach_gex_for_target` | total_gex, gex_sign, distance_to_{zero_gamma_flip, max_call_oi, max_put_oi} |
+| identity / labels | 10 | bar build + V1 labeling | — |
+| base micro | 133 | `single_contract.attach_base_microstructure_features` + T1.29 + ema-smoothed | T1.30 (Amihud), T1.39 (implied vol share + skew), T1.21/22 (OFI/aggressor), T2.01-T2.29 (returns/vol/jumps/...), T1.29 (liquidity migration L1↔L2/L3 — bid+ask), session/cyclic/overnight |
+| TC z-score normalizations | 72 | `attach_ts_normalizations` | 36 BASE_VALUE_COLS × 2 lookback days {30, 60} |
+| MAD z-score normalizations | 72 | same | robust-to-outliers variant |
+| L2 deep (composite) | 10 | `attach_l2_deep_features` | T1.10 dw_imbalance, T1.11 cum_imbalance, T1.14 depth_weighted_spread, T1.15 liq_adj_spread, T1.16 spread_acceleration, T1.20 HHI ×2, T1.31 deep_ofi ×2, T1.17 spread_z |
+| L2 per-level (k=1..10/5) | 40 | same | T1.09 vol_imbalance × 10, T1.13 basic_spread × 10, T1.31 ofi_at × 10, T1.18/19 order_count/size_imbalance × 5 |
+| patterns (T7.*) | 13 | `attach_pattern_features` | T7.01 absorption, T7.04-T7.06 breakouts/reversals/post-reversal flow, T7.07 spike_fade, T7.08 imbalance_persistence, T7.09 CVD_price_divergence, T7.10 range_compression |
+| engine | 4 | `attach_engine_features` | §8.A fracdiff(d=0.4) on log(close), §8.F round_pin distance N={10,25,50} |
+| sub-bar engines (5s) | 6 | `sub_bar_engines.attach_sub_bar_engine_features` | T1.40-T1.42 VPIN family, T1.44-T1.46 Hawkes family |
+| Phase E (exec/cancel/quote-direction) | 11 | `attach_phase_e_features` (gated on `--bars-phase-e-root` data) | T1.23 large_trade_share, T1.24 quote_to_trade, T1.25 quote_movement_directionality, T1.28 side_cond_resilience ×2, T1.35-T1.37 vwap_eff_spread + asym, T1.43 cancel_to_trade, T1.47/T7.12 hidden_absorption_ratio |
+| EMA-smoothed | 16 | `smoothed.py` | 8 base × spans {10, 30} causal EMA |
+| session / cyclic / overnight | 11 | `tc_features` + `overnight` | hour_et + 4 session flags + sin/cos minute + 4 overnight aggregates |
+| VX (vol-regime) | 20 | `external_sources.attach_vx_features` | T5.01-T5.07: vx1/2/3 mid + spread + zscore + calendar spread/ratio + term curvature |
+| GEX (options) | 9 | `external_sources.attach_gex_for_target` | T5 dealer-gamma family: total_gex, gex_sign, distance_to_{zero_gamma_flip, max_call_oi, max_put_oi}, ... |
 
-The exact column list is printed at the end of every `build_es_panel.py` run
+The exact column list is printed at the end of every `build_single_panel.py` run
 under `[col-summary]`.
 
----
+### Tier-by-tier coverage
 
-## V1.5+ deferred features (not in current panel)
-
-| Feature | Why deferred | What's needed |
+| Tier | Coverage | Status |
 |---|---|---|
-| **VPIN** (volume buckets, Easley-LdP) | Needs sub-bar trade stream at feature time | After 5-sec bars finish: per-day VPIN per bucket → asof-join to 15-min bars |
-| **Hawkes** (recursive λ_buy/λ_sell) | Same — needs actual Δt event stream | Same pattern |
-| **Effective spread / large-trade share / hidden-liquidity rolling ratio** | Needs Phase E (`bars_exec.py`) cols | Run a Phase E bar build for ES |
-| **Cancel-to-trade ratio** (T1.43) | Needs `bars_cancel.py` Phase | Same; cancel-proxy from MBP-10 snapshot deltas |
-| **Quote dynamics** (T1.24/25/28/29) | Needs per-quote-event aggregation inside the bar | Extend `bars_5sec.build_5sec_bars_core` to emit quote-update counts |
-| **Auto-d fracdiff** | Currently uses fixed d=0.4 | Calibrate per-instrument via `engines.fracdiff_auto_d` (ADF) once a year |
-| **Cross-sectional 30-instrument ranks + macro composites** | Out of V1 scope (single-contract focus) | Already wired in `panel.attach_cross_sectional_ranks` etc.; just not invoked by `build_es_panel.py` |
+| T1.01–T1.20 (L1/L2 from Phase A+B) | All implemented | ✅ |
+| T1.21–T1.22 (bar-level OFI) | All implemented | ✅ |
+| T1.23 LargeTradeVolumeShare | Phase E | ✅ |
+| T1.24 QuoteToTradeRatio | Phase E | ✅ |
+| T1.25 QuoteMovementDirectionality | Phase E + F | ✅ |
+| T1.26–T1.27 (depth ratios + side-weighted spread) | Implemented | ✅ |
+| T1.28 SideConditionedLiquidityShift | Phase E + F | ✅ |
+| T1.29 LiquidityMigration | from L1-L5 deltas | ✅ |
+| T1.30 AmihudIlliquidity | base micro | ✅ |
+| T1.31–T1.34 (DeepOFI, depth aggregates) | L2 deep | ✅ |
+| T1.35–T1.37 (effective spread family) | Phase E | ✅ |
+| T1.38 BookResilience | needs per-event +N-sec lookforward | ❌ V1.5 |
+| T1.39 ImpliedVolumeShare | base micro | ✅ |
+| T1.40–T1.42 VPIN family | sub-bar engines | ✅ |
+| T1.43 CancelToTradeRatio (L1 only) | Phase E | ✅ |
+| T1.44–T1.46 Hawkes family | sub-bar engines | ✅ |
+| T1.47 HiddenAbsorption | Phase E | ✅ |
+| T2.01–T2.29 (returns/vol family) | base micro + EMA | ✅ |
+| T3.* (cross-asset lead-lag) | wired in `cross_sectional.py`, not yet run | 🟡 V1.5 (orchestrator ready) |
+| T5 (VX + GEX) | external_sources | ✅ |
+| T6.* (calendar/temporal) | tc_features + overnight | ✅ partial (T6.05/06/08 macro events deferred) |
+| T7.01–T7.12 (patterns) | patterns + Phase E hidden | ✅ |
+
+### What's still NOT wired (single-contract)
+
+| Feature | Reason | Path forward |
+|---|---|---|
+| **T1.38 BookResilience** | Needs depth state at +N seconds AFTER each large trade — per-event lookforward, not a per-bar aggregation. | New `src/data/bars_resilience.py` per-trade processor + new bar-builder pass. V1.5. |
+| **T1.43 cancel proxy levels 2-5** | L1 wired; L2-L5 needs price-level promotion/demotion handling. | Extend `bars_cancel.py`. V1.5. |
+| **Auto-d fracdiff** | Currently fixed `d=0.4`. | Calibrate per-instrument once a year via `engines.fracdiff_auto_d` (ADF). V1.5. |
+| **T6.05/06/08 macro-event windows** | Need scraped macro calendar (BLS/Fed/EIA). | New `src/features/events.py` + CSV. V1.5. |
+| **Cross-sectional features** | Phase 4 orchestrator (`build_cross_panel.py`) ready; needs single panels for >1 instrument. | Run multi-instrument production build. |
+| **Tier 4 equity sector ETF features** | Needs new equity 1-sec TAQ ingest pipeline. | V2 — only if V1 OOS underperforms. |
+
+### Phase E status
+
+- **Bar-builder code**: ✅ complete (`scripts/build_phase_e_bars.py`, 22 cols emitted)
+- **Production build**: 🟡 SLURM 6922290 running for ES 2020-2024 (~2h ETA at writing)
+- **Final end-to-end smoke** (with Phase E enabled): pending SLURM completion. Expected col count: **~427**.
 
 ---
 

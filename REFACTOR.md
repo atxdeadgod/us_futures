@@ -1,7 +1,12 @@
 # Build-Pipeline Refactor
 
-**Status**: design — not yet executed. Companion to `BUILD_PIPELINE.md` (which
-documents the *current* state).
+**Status**: ✅ **executed** (commits 16ec935 → 5d41a1e, 2026-04-25). The
+target architecture below is now the actual state of the repo. Two of six
+steps were intentionally deferred — see "Migration plan" / "What shipped vs
+deferred" sections at the bottom.
+
+This doc remains in the repo as the architectural rationale; for operational
+"how to build" guidance see `BUILD_PIPELINE.md`.
 
 ## Why
 
@@ -200,3 +205,30 @@ Rough order of magnitude (1 person, focused):
 
 Total: ~5 days. Worth doing once V1 single-contract panels are stable and
 before adding cross-sectional features in earnest.
+
+---
+
+## What shipped vs deferred (post-execution, 2026-04-25)
+
+### ✅ Shipped
+
+| Step | Commit | Detail |
+|---|---|---|
+| 1. Module split | 16ec935 | `src/features/panel.py` → `single_contract.py` / `external_sources.py` / `cross_sectional.py` / `labeling.py`; `panel.py` retained as a thin facade for backward compat. |
+| 2. Script split | 16ec935 | `build_es_panel.py` → `build_futures_panel.py` + `build_options_panel.py` + `build_single_panel.py`. Legacy script removed. |
+| 3. Phase 4 orchestrator | 16ec935 | `scripts/build_cross_panel.py` + `build_cross_panel.sbatch` (4 targets × 5 years). |
+| 6. Cleanup | 16ec935 | Old `build_es_panel.py` and the older `build_features_panel.py` deleted. `panel.py` kept as shim (lighter than full removal; no behavioral cost). |
+
+### 🟡 Intentionally deferred
+
+| Step | Why | Trigger |
+|---|---|---|
+| 4. Bar-builder consolidation (`build_bars.py --mode`) | The 4 per-bar-type scripts work, are independent, and have different SLURM resource asks. Consolidating is cosmetic. | Skip until we feel real pain from script-count proliferation. |
+| 5. Caching / `_BUILD_INFO.json` sidecars | Premature; full rebuilds are ~5-10 min/year per stage so cost is bounded. | Add when iteration cadence on a stage exceeds ~5/day. |
+
+### Validation that the refactor preserves behavior
+
+Smoke-tested end-to-end on bigred for ES 2024 immediately after each refactor commit:
+- 16ec935 (post-split): 396-col futures panel matches pre-refactor 376 + 20 VX (which was newly wired same commit). Tests stayed at 249/249.
+- 040afc2 / 5d41a1e (Phase E + F additions): 416 cols (no Phase E parquet) → 9,970 valid labeled rows for 2024.
+- All 269 unit tests passing throughout the refactor.
