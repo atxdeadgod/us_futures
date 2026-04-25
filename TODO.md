@@ -107,5 +107,84 @@ based items can plug in later without pipeline rework.
   any new files landed that need reprocessing.
 - SPX chain job `6913304` pulls NDX/QQQ/RUT/IWM/DJX/DIA on top of already-done
   SPX/SPY. Confirm all 8 ticker-years complete.
-- VX futures (from Algoseek) — we have it but haven't built the VX-specific
-  5-sec bar pipeline yet. Needed for T5.01-T5.07.
+
+---
+
+## V1 build chain (in flight or imminent — 2026-04-25)
+
+V1 trades **4 equity-index futures** (ES, NQ, RTY, YM) but the directional
+prediction model needs **macro context** from the full 30-contract universe:
+DXY (USD strength) ↑ → equities up; gold + bonds bid + DXY ↓ → equities sell
+(risk-off composite). Without intermarket signal, equity-index directional
+prediction has no chance. So we build OHLCV bars for all 30 contracts;
+deeper L2 enrichment only for the 4 we actually trade.
+
+Four tracks chained sequentially via SLURM `afterok`:
+
+- **Track 0 (VIX sync)**: re-fetch VIX curves from `s3://vix-futures/taq/{YYYY}/{date}/`.
+  Original sync produced empty day-dirs (cause unidentified — possibly a
+  thread-pool race that swallowed errors). Bucket layout confirmed correct;
+  re-run via `scripts/sync_vix.py` + `sync_vix.sbatch`. ~30-60min, ~7.5GB.
+- **Track A (Phase A bars — ALL 30 contracts)**: Wraps
+  `src/data/bars_5sec.build_5sec_bars_core` per (instrument, day) → downsample
+  to 15m. Output: `bars_phase_a/{INSTR}/15m/{INSTR}_{YYYYMMDD}_15m.parquet`
+  with OHLCV + aggressor split + L1 close + spread sub-bar + CVD.
+  Universe (30): ES NQ RTY YM (equity indices, V1 trading); 6A 6B 6C 6E 6J
+  (FX, USD pairs); BZ CL HO NG RB (energy); GC HG PA PL SI (metals); SR3 TN
+  ZB ZF ZN ZT (rates / curve); ZC ZL ZM ZS ZW (ags). ~10-14h wall, 30 array
+  tasks (one per instrument).
+- **Track B (Phase B L2 bars — only 4 trading contracts)**: Reads Phase A bars
+  + depth events, calls `src/data/depth_snap.attach_book_snapshot` → adds 60
+  L2 columns (bid_px_L1..L10, ask_px_L1..L10, sizes, orders) + `book_ts_close`.
+  Output: `bars_phase_ab/{INSTR}/15m/...`. Restricted to ES/NQ/RTY/YM since
+  cross-asset macro features only need OHLCV-level data on the other 26.
+  ~16-20h.
+- **Track C (GEX features)**: Runs `compute_daily_gex_profile` per ticker × year
+  on SPX/SPY chain parquets. Output: `gex_features/{TICKER}_gex_profile_{YEAR}.parquet`.
+  V2 wires NDX→NQ, RUT→RTY, DJX→YM (chains already downloaded). ~30-60min.
+
+After all four complete, `src/features/panel.py` orchestrates the COMPLETE
+feature library:
+  - Per-trading-instrument single-instrument features (TC variants, overnight,
+    smoothed)
+  - Within-equity-index cross-sectional features (`bar_cross.py`, `l2_cross.py`):
+    dispersion, breadth, leader-laggard, pairwise z-scores
+  - Cross-asset MACRO features using all 30 OHLCV bars:
+    - Synthetic DXY composite from 6E/6J/6B/6C (~92% DXY weight coverage)
+    - Risk-on/off composite: gold (GC) + bonds (ZN, ZB) vs equities
+    - Rolling correlations of trading instruments vs each macro family
+    - Rates curve slope (2s5s, 5s10s, 10s30s from ZT/ZF/ZN/ZB)
+    - Energy / commodity divergence flags
+  - GEX features (SPX/SPY → ES/NQ-adjacent)
+  - VX features (when sync completes)
+
+Output: per-trading-instrument feature panel parquet with both single and
+cross-asset features. Then IC dashboard + ILP feature selection.
+
+## Post-VIX work (after Track 0 finishes)
+
+- **VX bar builder** — VX raw TAQ → 15-min bars for VX1, VX2, VX3 (front-three
+  monthly contracts). Mirrors `bars_5sec` + `bars_downsample` + roll handling.
+  Roll convention: monthly (VX has VXF/G/H/J/K/M/N/Q/U/V/X/Z monthly cycle).
+- **VX panel module**: take wide VX1/VX2/VX3 bars + apply `src/features/vx.py`
+  to emit term-structure features (calendar spread, ratio, curvature,
+  spread z-score, VX-mid z-score, vx-OFI-weighted).
+- **Attach VX features to ES bars**: VX trades on a different exchange (CFE)
+  with overlapping but not identical session hours. Use `engines.asof_strict_backward`
+  to attach the most recent VX bar to each ES bar.
+
+## Post-build cleanup (after V1 panel.py works end-to-end)
+
+- **Delete bars_phase_a parquets** once Phase B is stable (Phase B is a strict
+  superset). Keeping both wastes ~50% of disk.
+- **Index by (instrument, year) parquet partitioning** for the IC/dashboard
+  pipeline — per-day reads are slow at scale.
+
+## Open V1.5 / V2 work that this build unlocks
+
+- L1.x quote-derived features beyond `attach_book_snapshot`'s close-time
+  state (bid/ask velocity, midprice diffusion). Need event-stream access.
+- Cancel proxy at L2-L5 from depth event deltas (already TODO above).
+- Cross-asset GEX: NDX/QQQ for NQ, RUT/IWM for RTY, DJX/DIA for YM
+  (already downloaded; just wire into `attach_gex_features` per instrument).
+- Tier 5b term-structure (CL/NG/ZN curves) for V3 multi-asset extension.
