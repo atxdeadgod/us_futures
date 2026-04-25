@@ -24,6 +24,9 @@ import polars as pl
 from . import bar as bar_features
 from . import bar_agg
 from . import cross_asset_macro
+from . import deep_ofi as deep_ofi_features
+from . import gex as gex_features
+from . import l2 as l2_features
 from . import overnight
 from . import tc_features
 from ..labels.triple_barrier import triple_barrier_labels
@@ -326,6 +329,81 @@ def attach_cross_asset_composites(
                 out_col=f"corr_{target}_vs_{label}_w{rolling_corr_window}",
             )
     return df
+
+
+# ---------------------------------------------------------------------------
+# Step 5b — L2-deep features (only on Phase A+B bars for trading instruments)
+# ---------------------------------------------------------------------------
+
+def attach_l2_deep_features(
+    bars: pl.DataFrame,
+    depth: int = 10,
+    spread_z_window: int = 60,
+) -> pl.DataFrame:
+    """Attach L2-derived features to bars that have L1-L10 columns.
+
+    Requires bid_px_L{1..depth}, ask_px_L{1..depth}, bid_sz_L{1..depth},
+    ask_sz_L{1..depth} columns (output of `src/data/depth_snap.attach_book_snapshot`,
+    Track B Phase A+B bars).
+
+    Adds:
+        cum_imbalance_d{depth}        cumulative book imbalance over levels 1..depth
+        dw_imbalance_d{depth}         distance-weighted book imbalance
+        depth_weighted_spread_d{depth}
+        liquidity_adjusted_spread_d{depth}
+        spread_acceleration
+        hhi_d{depth}                  Herfindahl-Hirschman concentration of depth
+        deep_ofi_d{depth}_decay0      multi-level OFI, no decay
+        deep_ofi_d{depth}_decay03     multi-level OFI, exp decay = 0.3
+        spread_zscore_w{spread_z_window}  rolling z of L1 spread (calendar window)
+    """
+    df = bars.with_columns([
+        l2_features.cumulative_imbalance(depth=depth).alias(f"cum_imbalance_d{depth}"),
+        l2_features.distance_weighted_imbalance(depth=depth).alias(f"dw_imbalance_d{depth}"),
+        l2_features.depth_weighted_spread(depth=depth).alias(f"depth_weighted_spread_d{depth}"),
+        l2_features.liquidity_adjusted_spread(depth=depth).alias(f"liquidity_adjusted_spread_d{depth}"),
+        l2_features.spread_acceleration().alias("spread_acceleration"),
+        l2_features.herfindahl_hirschman_index(depth=depth).alias(f"hhi_d{depth}"),
+        deep_ofi_features.deep_ofi(max_depth=depth, decay=0.0).alias(f"deep_ofi_d{depth}_decay0"),
+        deep_ofi_features.deep_ofi(max_depth=depth, decay=0.3).alias(f"deep_ofi_d{depth}_decay03"),
+        l2_features.spread_zscore(depth=1, window=spread_z_window).alias(f"spread_zscore_w{spread_z_window}"),
+    ])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Step 5c — GEX features (target = ES in V1; later wire NDX→NQ etc.)
+# ---------------------------------------------------------------------------
+
+def attach_gex_for_target(
+    bars: pl.DataFrame,
+    daily_gex_paths: list[str],
+    es_spx_basis: pl.DataFrame | None = None,
+    ts_col: str = "ts",
+    close_col: str = "close",
+) -> pl.DataFrame:
+    """Attach SPX-derived GEX features to ES bars.
+
+    Args:
+        bars: ES bars with ts + close
+        daily_gex_paths: list of parquet paths produced by Track C
+            (build_gex_features.py); typically one per year.
+        es_spx_basis: optional DataFrame [date, basis] where basis = ES_close − SPX_close
+            on each date. If None, basis is set to 0 for all dates (coarse but
+            adequate for V1; refine with actual basis data in V1.5).
+        ts_col, close_col: target bar column names.
+
+    Adds the columns produced by `src/features/gex.attach_gex_features`.
+    """
+    if not daily_gex_paths:
+        return bars
+    daily = pl.concat([pl.scan_parquet(p) for p in daily_gex_paths],
+                       how="vertical_relaxed").collect()
+    if es_spx_basis is None:
+        es_spx_basis = daily.select("date").with_columns(pl.lit(0.0).alias("basis"))
+    return gex_features.attach_gex_features(
+        bars, daily, es_spx_basis, ts_col=ts_col, close_col=close_col,
+    )
 
 
 # ---------------------------------------------------------------------------

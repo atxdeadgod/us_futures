@@ -309,6 +309,92 @@ def test_step6_joins_wide_cross_asset_drops_target_prefix():
     assert "NQ_log_return" in out.columns
 
 
+# ---------------------------------------------------------------------------
+# Step 5b: attach_l2_deep_features
+# ---------------------------------------------------------------------------
+
+def _mk_phase_b_bars(n_bars: int = 30, depth: int = 10):
+    """Phase A+B bars: Phase A columns + L1..L10 book snapshot."""
+    rng = np.random.default_rng(7)
+    rows = []
+    base = datetime(2024, 3, 4, 14, 30, tzinfo=timezone.utc)
+    for i in range(n_bars):
+        ts = base + timedelta(minutes=15 * i)
+        mid = 5000.0 + rng.normal(0, 1.0)
+        d = {"ts": ts, "open": mid, "high": mid + 0.5, "low": mid - 0.5,
+             "close": mid, "volume": 1000, "buys_qty": 500, "sells_qty": 500,
+             "trades_count": 100, "mid_close": mid,
+             "bid_close": mid - 0.125, "ask_close": mid + 0.125,
+             "spread_abs_close": 0.25, "cvd_globex": float(i)}
+        for k in range(1, depth + 1):
+            d[f"bid_px_L{k}"] = mid - 0.25 * k
+            d[f"ask_px_L{k}"] = mid + 0.25 * k
+            d[f"bid_sz_L{k}"] = 100 - 5 * (k - 1)
+            d[f"ask_sz_L{k}"] = 100 - 5 * (k - 1) + int(rng.normal(0, 2))
+            d[f"bid_ord_L{k}"] = 10
+            d[f"ask_ord_L{k}"] = 10
+        rows.append(d)
+    return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+
+def test_step5b_l2_deep_features_emit_expected_columns():
+    bars = _mk_phase_b_bars(n_bars=80, depth=10)
+    out = panel.attach_l2_deep_features(bars, depth=10, spread_z_window=20)
+    expected = [
+        "cum_imbalance_d10", "dw_imbalance_d10",
+        "depth_weighted_spread_d10", "liquidity_adjusted_spread_d10",
+        "spread_acceleration", "hhi_d10",
+        "deep_ofi_d10_decay0", "deep_ofi_d10_decay03",
+        "spread_zscore_w20",
+    ]
+    for c in expected:
+        assert c in out.columns, f"missing L2-deep column: {c}"
+
+
+# ---------------------------------------------------------------------------
+# Step 5c: attach_gex_for_target
+# ---------------------------------------------------------------------------
+
+def test_step5c_attach_gex_for_target_with_synthetic_profile(tmp_path):
+    """End-to-end: write a tiny GEX profile parquet, join onto target bars."""
+    from datetime import date
+    # Tiny daily GEX profile
+    profile = pl.DataFrame({
+        "date": [date(2024, 1, 2), date(2024, 1, 3)],
+        "total_gex": [1.0e9, -2.0e9],
+        "gex_sign": [1, -1],
+        "zero_gamma_strike": [5000.0, 5050.0],
+        "max_call_oi_strike": [5100.0, 5150.0],
+        "max_put_oi_strike": [4900.0, 4950.0],
+        "gex_0dte_share": [0.3, 0.4],
+        "gex_0dte_only": [3.0e8, -8.0e8],
+        "gex_without_0dte": [7.0e8, -1.2e9],
+    }).with_columns(pl.col("date").cast(pl.Date))
+    profile_path = tmp_path / "gex_profile_2024.parquet"
+    profile.write_parquet(profile_path)
+
+    # Target ES bars on 2024-01-03 (uses 2024-01-02 EOD profile per attach_gex_features)
+    bars = pl.DataFrame({
+        "ts": [datetime(2024, 1, 3, 14, 30, tzinfo=timezone.utc),
+               datetime(2024, 1, 3, 14, 45, tzinfo=timezone.utc)],
+        "close": [5050.0, 5060.0],
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+    out = panel.attach_gex_for_target(bars, [str(profile_path)])
+    # GEX features should be attached
+    for c in ("total_gex", "gex_sign", "distance_to_zero_gamma_flip",
+              "distance_to_max_call_oi", "distance_to_max_put_oi"):
+        assert c in out.columns, f"missing GEX column: {c}"
+
+
+def test_step5c_attach_gex_empty_paths_passthrough():
+    """Empty list of GEX paths → bars unchanged."""
+    bars = pl.DataFrame({"ts": [datetime(2024, 1, 1, tzinfo=timezone.utc)],
+                          "close": [5000.0]}).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+    out = panel.attach_gex_for_target(bars, [])
+    assert out.columns == bars.columns
+
+
 def test_per_instrument_pipeline_attaches_session_flags_and_overnight():
     """The end-to-end per-instrument pipeline adds session flags + overnight features."""
     bars = _mk_phase_a_bars(n_days=10)

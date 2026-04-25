@@ -60,6 +60,13 @@ def main() -> int:
     p.add_argument("--target", required=True, choices=panel.TRADING_INSTRUMENTS)
     p.add_argument("--bars-phase-a-root", required=True,
                    help="Root containing {INSTR}/15m/{INSTR}_{YYYYMMDD}_15m.parquet")
+    p.add_argument("--bars-phase-ab-root", default=None,
+                   help="Optional Phase A+B (with L2 depth) bars root for the target only. "
+                        "If supplied, the target's bars are loaded from here and L2-deep "
+                        "features are attached.")
+    p.add_argument("--gex-root", default=None,
+                   help="Optional root containing GEX profile parquets (Track C output). "
+                        "Only used when target=ES. Looks for SPX_gex_profile_*.parquet.")
     p.add_argument("--start", required=True, help="YYYY-MM-DD inclusive")
     p.add_argument("--end", required=True, help="YYYY-MM-DD inclusive")
     p.add_argument("--out-root", required=True)
@@ -67,6 +74,8 @@ def main() -> int:
                    help="Comma-separated TS-normalization lookbacks")
     p.add_argument("--rolling-corr-window", type=int, default=60,
                    help="Window for cross-asset rolling correlations")
+    p.add_argument("--l2-depth", type=int, default=10,
+                   help="Number of book levels to use for L2-deep features (when --bars-phase-ab-root)")
     p.add_argument("--allow-oos", action="store_true",
                    help="Override the 2024-01-01 OOS guardrail (use only for explicit OOS panels)")
     args = p.parse_args()
@@ -80,6 +89,8 @@ def main() -> int:
         )
 
     bars_phase_a_root = Path(args.bars_phase_a_root)
+    bars_phase_ab_root = Path(args.bars_phase_ab_root) if args.bars_phase_ab_root else None
+    gex_root = Path(args.gex_root) if args.gex_root else None
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -101,6 +112,24 @@ def main() -> int:
     if args.target not in per_instr:
         raise SystemExit(f"target={args.target} has no Phase A bars in range; aborting")
 
+    # ---- Step 5b (optional): swap target bars for Phase A+B + attach L2-deep ----
+    if bars_phase_ab_root is not None:
+        ab_target = _load_phase_a_bars_for_instrument(bars_phase_ab_root, args.target, start, end)
+        if ab_target is not None:
+            from src.features.tc_features import attach_session_flags as _flags
+            ab_target = _flags(ab_target)
+            ab_target = panel.build_per_instrument_features(
+                ab_target.drop([c for c in ("hour_et", "is_asia", "is_eu", "is_rth", "is_eth")
+                                 if c in ab_target.columns]),
+                lookback_days_grid=lookback_grid,
+            )
+            ab_target = panel.attach_l2_deep_features(ab_target, depth=args.l2_depth)
+            print(f"[panel] target {args.target}: swapped to Phase A+B with L2-deep features ({ab_target.width} cols)")
+            per_instr[args.target] = ab_target
+        else:
+            print(f"[warn] {args.target}: Phase A+B bars missing under {bars_phase_ab_root}; "
+                  f"continuing with Phase A only", file=sys.stderr)
+
     # ---- Step 3: wide cross-asset join ----
     wide = panel.build_wide_cross_asset_frame(per_instr, base_value_cols=panel.BASE_VALUE_COLS)
     print(f"[panel] wide frame: {wide.height:,} ts x {wide.width} cols")
@@ -116,10 +145,21 @@ def main() -> int:
     wide = panel.attach_cross_asset_composites(wide, rolling_corr_window=args.rolling_corr_window)
     print(f"[panel] + composites: {wide.width} cols")
 
+    # ---- Step 5c (optional): GEX features for ES target ----
+    target_bars = per_instr[args.target]
+    if args.target == "ES" and gex_root is not None:
+        gex_paths = sorted(glob.glob(str(gex_root / "SPX_gex_profile_*.parquet")))
+        if gex_paths:
+            target_bars = panel.attach_gex_for_target(target_bars, gex_paths)
+            print(f"[panel] + GEX features (SPX → ES): {target_bars.width} cols")
+        else:
+            print(f"[warn] gex_root={gex_root} contains no SPX_gex_profile_*.parquet; "
+                  f"GEX features skipped", file=sys.stderr)
+
     # ---- Step 6: assemble target panel + labels ----
     out_panel = panel.assemble_target_panel(
         target=args.target,
-        target_bars_with_features=per_instr[args.target],
+        target_bars_with_features=target_bars,
         wide_cross_asset=wide,
     )
     print(f"[panel] target panel: {out_panel.height:,} valid bars x {out_panel.width} cols")
