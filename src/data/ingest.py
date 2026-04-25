@@ -136,12 +136,24 @@ def read_taq(cf: ContractFile) -> pl.DataFrame:
 
 
 def read_depth(cf: ContractFile) -> pl.DataFrame:
-    """Read a single Algoseek multiple-depth file. Parsed `ts`; rows are per-side (B/S) L1..L10 snapshots."""
+    """Read a single Algoseek multiple-depth file. Parsed `ts`; rows are per-side (B/S) L1..L10 snapshots.
+
+    Schema notes: depth files have L1..L10 Price/Size/Orders columns. Levels
+    deeper than the active book are often null/zero in the early rows of a
+    file, so polars' default schema inference (first ~100 rows) sees integer-
+    only data and infers `i64`. Later rows have fractional prices (e.g.
+    `4390.250000`) that don't fit i64 → ComputeError mid-parse.
+
+    Fix: explicitly force all L{k}Price columns to Float64 via schema_overrides.
+    Sizes and Orders are kept as Int64 (counts/quantities). Other columns are
+    left to inference.
+    """
     if cf.dataset != "depth":
         raise ValueError("read_depth expects a depth ContractFile")
     if not cf.exists:
         raise FileNotFoundError(cf.path)
-    df = pl.read_csv(cf.path)
+    price_cols_float = {f"L{k}Price": pl.Float64 for k in range(1, 11)}
+    df = pl.read_csv(cf.path, schema_overrides=price_cols_float)
     return _parse_ts(df)
 
 
