@@ -128,10 +128,10 @@ input dependencies. SLURM array tasks are independent days × instruments.
 - **Status**: ✅ done — SPX + SPY × 2020-2024.
 
 ### S6. Futures feature panel (Phase 2b — bar-derived per-instrument features)
-- **Reads**: Phase A+B bars (or Phase A with `--no-l2-deep`) + VX1/VX2/VX3 bars (optional).
+- **Reads**: Phase A+B bars (or Phase A with `--no-l2-deep`) + VX1/VX2/VX3 bars (optional) + 5-sec bars (optional, for VPIN/Hawkes).
 - **Writes**: `features/futures/{INSTR}_{YEAR}.parquet`.
 - **Script**: `scripts/build_futures_panel.py`, `build_futures_panel.sbatch` (array=0-4, one year per task; override INSTR via env).
-- **Pipeline** (orchestrated by `src/features/single_contract.build_per_instrument_features` + `attach_l2_deep_features` + `external_sources.attach_vx_features`):
+- **Pipeline** (orchestrated by `src/features/single_contract.build_per_instrument_features` + `attach_l2_deep_features` + `external_sources.attach_vx_features` + `sub_bar_engines.attach_sub_bar_engine_features`):
 
   ```
   load Phase A+B bars (year)             →  90 cols
@@ -142,10 +142,13 @@ input dependencies. SLURM array tasks are independent days × instruments.
   ├── attach_l2_deep_features (depth=10)     +50
   ├── attach_ts_normalizations               +136
   ├── attach_ema_smoothed                    +16
-  └── attach_vx_features                     +20
+  ├── attach_vx_features                     +20
+  └── attach_sub_bar_engine_features         +6   (VPIN + Hawkes from 5-sec bars)
                                              ─────
-                                             ~376 cols
+                                             ~382 cols
   ```
+- **Sub-bar engines**: requires 5-sec bars at `--bars-5s-root`. Disable with
+  `--no-sub-bar-engines`. Tunable: `--vpin-bucket-size`, `--hawkes-hl-fast`, `--hawkes-hl-slow`.
 
 ### S7. Options feature panel (Phase 2b — GEX-derived per-target features)
 - **Reads**: GEX daily profile parquet (`SPX_gex_profile_{YEAR}.parquet`) + target's bars (just ts + close).

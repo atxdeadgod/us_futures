@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from src.features import external_sources, single_contract
+from src.features import external_sources, single_contract, sub_bar_engines
 
 
 def _stitch_per_day_parquets(root: Path, instr: str, horizon: str,
@@ -52,10 +52,17 @@ def main() -> int:
     p.add_argument("--out", required=True, help="Output root; futures panel writes to {out}/futures/")
     p.add_argument("--bars-phase-a-root", default="/N/project/ksb-finance-backtesting/data/bars_phase_a")
     p.add_argument("--bars-phase-ab-root", default="/N/project/ksb-finance-backtesting/data/bars_phase_ab")
+    p.add_argument("--bars-5s-root", default="/N/project/ksb-finance-backtesting/data/bars_5sec",
+                   help="Root for 5-sec bars (used for VPIN + Hawkes engines). Skip if not present.")
     p.add_argument("--horizon", default="15m")
     p.add_argument("--no-l2-deep", action="store_true",
                    help="Skip L2-deep features (use Phase A only)")
     p.add_argument("--no-vx", action="store_true")
+    p.add_argument("--no-sub-bar-engines", action="store_true",
+                   help="Skip VPIN + Hawkes (sub-bar engine) features")
+    p.add_argument("--vpin-bucket-size", type=int, default=25_000)
+    p.add_argument("--hawkes-hl-fast", type=float, default=5.0)
+    p.add_argument("--hawkes-hl-slow", type=float, default=60.0)
     args = p.parse_args()
 
     out_root = Path(args.out) / "futures"
@@ -97,6 +104,22 @@ def main() -> int:
             print(f"  after VX: cols={len(feat.columns)}")
         except FileNotFoundError as e:
             print(f"  [skip-vx] {e}")
+
+    if not args.no_sub_bar_engines:
+        bars_5s_root = Path(args.bars_5s_root)
+        try:
+            print(f"[features] sub-bar engines (VPIN + Hawkes) from {bars_5s_root}")
+            bars_5s = _stitch_per_day_parquets(bars_5s_root, args.instrument, "5s", args.year)
+            print(f"  loaded {bars_5s.height:,} 5-sec bars")
+            feat = sub_bar_engines.attach_sub_bar_engine_features(
+                feat, bars_5s,
+                vpin_bucket_size=args.vpin_bucket_size,
+                hawkes_hl_fast=args.hawkes_hl_fast,
+                hawkes_hl_slow=args.hawkes_hl_slow,
+            )
+            print(f"  after sub-bar engines: cols={len(feat.columns)}")
+        except FileNotFoundError as e:
+            print(f"  [skip-sub-bar] {e}")
 
     out_path = out_root / f"{args.instrument}_{args.year}.parquet"
     feat.write_parquet(out_path, compression="zstd", compression_level=3)

@@ -147,9 +147,16 @@ def vpin_volume_buckets(
         vols.append(int(cum_total))
         counts.append(len(sub_bars) - start_i)
 
+    # Build bucket_close_ts with the source's exact ts dtype. Without this,
+    # polars infers `Datetime[μs]` from a list of numpy datetime64[ns] scalars
+    # and silently misinterprets ns values as μs (year 56144 garbage). Going
+    # through np.asarray preserves the datetime64 dtype, then we cast to the
+    # source's exact dtype (carries the timezone, which numpy doesn't).
+    ts_dtype = sub_bars.schema[ts_col]
+    closes_arr = np.asarray(closes) if closes else np.array([], dtype="datetime64[ns]")
     return pl.DataFrame(
         {
-            "bucket_close_ts": closes,
+            "bucket_close_ts": pl.Series("bucket_close_ts", closes_arr).cast(ts_dtype),
             "vpin": vpins,
             "bucket_volume": vols,
             "n_sub_bars": counts,

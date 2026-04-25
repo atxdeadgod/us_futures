@@ -38,7 +38,8 @@ def _print_col_summary(feat: pl.DataFrame) -> None:
     grouped: dict[str, list[str]] = {
         "base": [], "norm_tc_z": [], "norm_madz": [],
         "L2_deep": [], "L2_per_level": [],
-        "patterns": [], "engines": [], "vx": [], "gex": [],
+        "patterns": [], "engines": [], "sub_bar_engines": [],
+        "vx": [], "gex": [],
         "ema_smoothed": [], "session/cyclic/overnight": [], "labels/identity": [],
     }
     for c in feat.columns:
@@ -60,6 +61,7 @@ def _print_col_summary(feat: pl.DataFrame) -> None:
             or c == "atr_proxy":
             grouped["patterns"].append(c)
         elif c.startswith("fracdiff_") or c.startswith("round_pin_"): grouped["engines"].append(c)
+        elif c.startswith("vpin") or c.startswith("hawkes_"): grouped["sub_bar_engines"].append(c)
         elif c.startswith("gex_") or c in ("total_gex", "gex_sign", "distance_to_zero_gamma_flip",
                                              "distance_to_max_call_oi", "distance_to_max_put_oi"):
             grouped["gex"].append(c)
