@@ -309,6 +309,33 @@ def test_step6_joins_wide_cross_asset_drops_target_prefix():
     assert "NQ_log_return" in out.columns
 
 
+def test_per_instrument_pipeline_attaches_session_flags_and_overnight():
+    """The end-to-end per-instrument pipeline adds session flags + overnight features."""
+    bars = _mk_phase_a_bars(n_days=10)
+    out = panel.build_per_instrument_features(bars, lookback_days_grid=(20,))
+    # Session flags
+    for c in ("hour_et", "is_asia", "is_eu", "is_rth", "is_eth"):
+        assert c in out.columns, f"missing session flag column: {c}"
+    # Overnight features
+    for c in (
+        "overnight_log_return", "overnight_realized_vol",
+        "overnight_volume_total", "overnight_n_bars",
+    ):
+        assert c in out.columns, f"missing overnight feature column: {c}"
+
+
+def test_per_instrument_pipeline_attach_overnight_off():
+    """attach_overnight=False disables the overnight pass."""
+    bars = _mk_phase_a_bars(n_days=10)
+    out = panel.build_per_instrument_features(
+        bars, lookback_days_grid=(20,), attach_overnight=False,
+    )
+    # Session flags still added (needed for downstream regardless)
+    assert "is_rth" in out.columns
+    # Overnight columns NOT added
+    assert "overnight_log_return" not in out.columns
+
+
 def test_step6_drop_invalid_filter():
     """drop_invalid=False keeps warmup rows; drop_invalid=True removes them."""
     bars = _mk_phase_a_bars(n_days=200)

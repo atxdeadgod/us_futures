@@ -423,14 +423,33 @@ def build_per_instrument_features(
     rv_window: int = 20,
     range_vol_window: int = 20,
     vol_surprise_window: int = 60,
+    attach_overnight: bool = True,
 ) -> pl.DataFrame:
-    """End-to-end per-instrument feature pipeline (steps 1 + 2)."""
+    """End-to-end per-instrument feature pipeline.
+
+    Calls in order:
+      step 1  attach_base_microstructure_features
+      session flags (force consistent hour_et / is_rth / is_eu / is_asia / is_eth
+                     using V1 convention; overrides any pre-existing flags)
+      overnight features (if attach_overnight=True): per-trading-day overnight
+                     gap, realized vol, volume, n_bars — broadcast to every bar
+                     in the day. Lets RTH bars use overnight context as features.
+      step 2  attach_ts_normalizations on BASE_VALUE_COLS
+
+    Note: overnight columns are NOT in BASE_VALUE_COLS, so they don't get
+    TC/MAD z-scored or cross-sectionally ranked in V1. They flow through to
+    the final panel as raw daily values per bar. Per-asset overnight ranks
+    can be added in V1.5 by extending the wide-join + CS-ranks pipeline.
+    """
     df = attach_base_microstructure_features(
         bars,
         rv_window=rv_window,
         range_vol_window=range_vol_window,
         vol_surprise_window=vol_surprise_window,
     )
+    df = tc_features.attach_session_flags(df)
+    if attach_overnight:
+        df = overnight.attach_overnight_features(df)
     df = attach_ts_normalizations(
         df,
         value_cols=BASE_VALUE_COLS,
