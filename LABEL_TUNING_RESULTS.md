@@ -117,3 +117,134 @@ The wider stability-best combos remain available as fallback options (V2) if reg
 - **Alternative labelers worth comparing**: efficiency-ratio-based labels (Kaufman), drawdown-aware labels, signed-return regression target. May offer different tradeoffs in label noise vs predictability.
 - **Wider T grid**: current grid tops at T=24 (6h horizon). Worth probing T={32, 48} (8-12h) to see if longer horizons offer better corr at the cost of fewer trades.
 - **Verify cost assumptions** with actual IBKR commission + measured slippage on small live trades; especially RTY/YM where cost estimates are lower-confidence.
+
+---
+
+## Daily volume + variance share by ET hour (IS 2020-2023)
+
+Computed on the OHLCV-only bars for each instrument (1038 trading days) — used to
+decide whether the closing rotation hour (15:00-16:00 ET) and the post-NYSE-close
+window (16:00-17:00 ET) should be labeled. Both turned out to be major windows;
+together they justify implementing halt-truncated forward windows rather than
+dropping pre-halt bars.
+
+```
+--- ES ---
+ h_et  vol_pct  var_pct  session
+    0     0.41     1.37       ASIA
+    1     0.50     1.63       ASIA
+    2     0.80     2.17       ASIA
+    3     1.55     3.32         EU
+    4     1.42     3.01         EU
+    5     1.16     2.03         EU
+    6     1.16     2.03         EU
+    7     1.45     2.70         EU
+    8     2.68     6.55         EU
+    9     9.12     7.52        RTH
+   10    16.52    11.26        RTH
+   11    11.73     7.81        RTH
+   12     8.53     5.74        RTH
+   13     7.70     5.59        RTH
+   14     8.53     5.96        RTH
+   15    10.54     7.33  RTH-CLOSE
+   16    12.24     7.93        ETH
+   17     0.29     0.31         EU
+   18     0.42     1.68       ASIA
+   19     0.51     2.76       ASIA
+   20     0.82     5.91       ASIA
+   21     0.79     2.40       ASIA
+   22     0.65     1.79       ASIA
+   23     0.48     1.20       ASIA
+  >> 15:00-16:00 ET (closing rotation): vol=10.54%, var=7.33%
+
+--- NQ ---
+ h_et  vol_pct  var_pct  session
+    0     0.59     1.13       ASIA
+    1     0.71     1.35       ASIA
+    2     1.05     1.86       ASIA
+    3     1.80     3.14         EU
+    4     1.71     2.61         EU
+    5     1.35     1.72         EU
+    6     1.33     1.91         EU
+    7     1.68     2.35         EU
+    8     3.02     6.67         EU
+    9    10.28     9.03        RTH
+   10    17.71    13.58        RTH
+   11    12.23     8.63        RTH
+   12     9.05     6.15        RTH
+   13     7.84     5.51        RTH
+   14     8.30     6.15        RTH
+   15     9.30     6.73  RTH-CLOSE
+   16     7.14     7.77        ETH
+   17     0.22     0.27         EU
+   18     0.52     1.71       ASIA
+   19     0.65     2.31       ASIA
+   20     1.00     4.77       ASIA
+   21     1.00     2.09       ASIA
+   22     0.85     1.55       ASIA
+   23     0.66     1.02       ASIA
+  >> 15:00-16:00 ET (closing rotation): vol=9.30%, var=6.73%
+
+--- RTY ---
+ h_et  vol_pct  var_pct  session
+    0     0.27     0.98       ASIA
+    1     0.33     1.23       ASIA
+    2     0.55     1.73       ASIA
+    3     1.13     2.93         EU
+    4     1.11     2.56         EU
+    5     0.95     1.86         EU
+    6     0.98     1.80         EU
+    7     1.30     2.85         EU
+    8     2.59     5.90         EU
+    9    11.85    12.06        RTH
+   10    17.77    15.91        RTH
+   11    11.45     8.56        RTH
+   12     8.28     5.82        RTH
+   13     7.19     5.28        RTH
+   14     7.82     5.85        RTH
+   15     9.54     6.09  RTH-CLOSE
+   16    13.90     5.69        ETH
+   17     0.36     0.34         EU
+   18     0.42     1.27       ASIA
+   19     0.42     2.30       ASIA
+   20     0.58     4.64       ASIA
+   21     0.50     1.91       ASIA
+   22     0.41     1.51       ASIA
+   23     0.31     0.95       ASIA
+  >> 15:00-16:00 ET (closing rotation): vol=9.54%, var=6.09%
+
+--- YM ---
+ h_et  vol_pct  var_pct  session
+    0     0.71     1.43       ASIA
+    1     0.90     1.69       ASIA
+    2     1.49     2.16       ASIA
+    3     2.81     3.35         EU
+    4     2.60     3.10         EU
+    5     2.01     2.06         EU
+    6     2.01     2.04         EU
+    7     2.36     3.10         EU
+    8     3.55     5.63         EU
+    9    10.97     9.33        RTH
+   10    16.23    11.43        RTH
+   11    10.87     7.52        RTH
+   12     7.66     5.50        RTH
+   13     6.73     5.69        RTH
+   14     7.39     5.45        RTH
+   15     8.64     7.20  RTH-CLOSE
+   16     7.11     7.60        ETH
+   17     0.25     0.34         EU
+   18     0.62     1.64       ASIA
+   19     0.85     2.67       ASIA
+   20     1.26     5.63       ASIA
+   21     1.18     2.46       ASIA
+   22     1.01     1.78       ASIA
+   23     0.78     1.18       ASIA
+  >> 15:00-16:00 ET (closing rotation): vol=8.64%, var=7.20%
+```
+
+Key takeaways feeding the halt-truncation decision:
+- **15:00-16:00 ET (closing rotation)** is **8-11% of daily volume / 6-7% of variance** across all four instruments — comparable to mid-RTH hours; cannot be dropped.
+- **16:00-17:00 ET (post-NYSE close)** is **7-14% of daily volume / 6-8% of variance**: RTY hour 16 is its single largest hour; ES hour 16 is third-largest. Originally bucketed as low-priority "ETH" — the data corrects that view.
+- **Hour 10 ET (10:00-11:00) is the volume + variance peak** for all four (16-18% volume; 11-16% variance) — the post-NYSE-open hour is the most informative window of the day.
+- **17:00-18:00 ET halt** is genuinely empty (hour 17 ET = 0.2-0.4% volume; what's there is residual transition-bar noise).
+- **20:00-21:00 ET (Asian session start)** has elevated *variance* (4.6-5.9%) on relatively low *volume* (0.5-1.3%) — variance/volume ratio is highest here. Asian-policy / news-release driven moves on thin liquidity.
