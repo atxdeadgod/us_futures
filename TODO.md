@@ -188,3 +188,76 @@ cross-asset features. Then IC dashboard + ILP feature selection.
 - Cross-asset GEX: NDX/QQQ for NQ, RUT/IWM for RTY, DJX/DIA for YM
   (already downloaded; just wire into `attach_gex_features` per instrument).
 - Tier 5b term-structure (CL/NG/ZN curves) for V3 multi-asset extension.
+
+---
+
+## Panel.py architecture (decided 2026-04-25)
+
+Locked decisions for the cross-asset-aware feature builder we'll build after
+the bar chain finishes:
+
+- **Full TS features on all 30 contracts** (not just trading 4). Each contract
+  gets TC z-score, MAD z-score, rolling quantile rank for each base value
+  (return, abs_return, log_volume, OFI, CVD_change, spread_z, vol_surprise).
+  The 26 non-trading contracts contribute through their TS features as inputs
+  to the trading-contract panels (e.g., GC's TC z-score of OFI as a feature
+  for predicting ES). Storage / compute cheap; ILP does the pruning.
+- **Cross-sectional Gauss-Rank features** (NEW) — every base value gets ranked
+  two ways at each ts:
+  - Across the full 30-contract universe (gives "vs market" position)
+  - Within asset class (equity-indices / rates / FX / energy / metals / ags)
+    so equity-index relative ranks aren't diluted by gold/oil context
+  Gauss-Rank: rank → quantile → inverse normal CDF → bounded standard-normal
+  values; outlier-tame, symmetric, ideal for tree models.
+- **NO threshold-engineered features.** Pre-engineered binary "significant
+  move" flags or excess-magnitude features lock in arbitrary thresholds the
+  model can't override; they throw away smooth distributional information.
+  LightGBM does its own thresholding via tree splits — give it smooth
+  continuous distributional features and let it find the splits.
+- **L2 deep features only on 4 trading contracts** (Phase B output).
+- **Composite features** (continuous, not binary): synthetic DXY (weighted
+  6E/6J/6B/6C), rates curve slopes (2s5s/5s10s/10s30s), risk-on/off
+  composite as a continuous z-weighted score, cross-asset rolling correlations.
+
+---
+
+## Feature-selection methodology — beyond IC (V1.5)
+
+IC dashboard + ILP ρ<0.45 selection captures CORRELATION with the target but
+not CAUSATION. Two features can be near-identically correlated with the label
+yet have very different causal structures (common-cause vs lead-lag vs
+collider-bias). Add a causation layer before final feature lock-in:
+
+- **Lead-lag IC scan**: for each candidate feature, also score it at lags
+  k = -3, -1, 0, +1, +3. Features with peak IC at *lagged* values
+  (X(t-k) → label(t)) carry directional info. Features with peak IC at
+  k=0 only may be coincidental / common-cause-driven.
+- **Granger causality** for the top-IC features: does past X help predict
+  Y beyond past Y alone? Standard implementation: pairwise F-test on a
+  VAR(p) lag selection. Available in statsmodels.
+- **Ablation studies** during model training: train with/without specific
+  features, measure OOS delta. The "true alpha" features survive ablation.
+- **Permutation feature importance** (post-training): randomize each
+  feature in turn, measure prediction degradation. Better than tree-based
+  feature importance because it captures actual prediction usage, not
+  split frequency.
+- **Stability across regimes**: causally-driven features should retain IC
+  across different vol regimes (COVID 2020 vs calm 2023). Spurious-
+  correlation features tend to break across regime shifts.
+
+Trigger: after V1 model trains and we have OOS performance. If V1 ships and
+works, the causation layer becomes a V1.5 robustness investment to make the
+model more durable against regime change.
+
+---
+
+## V1 build chain — still in flight (job IDs 6915995 → 6915996 → 6915997 → 6915998)
+
+- 6915995 (VIX sync, array 0-5 by year) — pending, no deps
+- 6915996 (Phase A bars, array 0-29 across 30 contracts) — held on afterok:VIX
+- 6915997 (Phase B L2, array 0-3 ES/NQ/RTY/YM only) — held on afterok:A
+- 6915998 (GEX features, single node) — held on afterok:B
+
+While bars build, develop `src/features/cross_asset_macro.py` (TC + MAD +
+quantile rank + Gauss-Rank + composites) and `src/features/panel.py`
+(orchestrator) so they're ready when bars finish.
