@@ -82,7 +82,7 @@ def test_upper_barrier_hit_first():
     low = np.array([99.5, 100.0, 100.5, 101.5, 102.5, 103.5])
     open_ = close.copy()
     atr = np.array([1.0] * 6)
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=5
     )
     # From i=0: upper=101.5, lower=98.5. high[2]=101.5 hits upper first.
@@ -98,7 +98,7 @@ def test_lower_barrier_hit_first():
     low = np.array([99.5, 99.0, 98.5, 97.5, 96.5, 95.5])
     open_ = close.copy()
     atr = np.array([1.0] * 6)
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=5
     )
     # From i=0: upper=101.5, lower=98.5. low[2]=98.5 hits lower first.
@@ -114,7 +114,7 @@ def test_time_expired_zero_label():
     low = np.array([99.9] * 10)
     open_ = close.copy()
     atr = np.array([1.0] * 10)
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=2.0, k_dn=2.0, T=4
     )
     # Barriers at ±2.0; market stays in ±0.1. Time-expired → label 0, offset=4
@@ -130,7 +130,7 @@ def test_within_bar_ambiguity_up_close():
     low = np.array([99.5, 98.0])  # hits lower 98.5
     open_ = np.array([100.0, 99.0])  # open < close at bar 1 → upward bar
     atr = np.array([1.0, 1.0])
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=3
     )
     # From i=0: both barriers hit at j=1. close[1]=102 > open[1]=99 → +1
@@ -145,7 +145,7 @@ def test_within_bar_ambiguity_down_close():
     low = np.array([99.5, 98.0])  # hits lower 98.5
     open_ = np.array([100.0, 102.0])  # open > close at bar 1 → downward bar
     atr = np.array([1.0, 1.0])
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=3
     )
     assert labels[0] == -1
@@ -159,7 +159,7 @@ def test_nan_atr_gives_zero_label():
     low = np.array([99.5, 100.5, 101.5])
     open_ = close.copy()
     atr = np.array([np.nan, 1.0, 1.0])
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
+    labels, offsets, rets, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=2
     )
     assert labels[0] == 0
@@ -175,12 +175,13 @@ def test_triple_barrier_labels_schema():
     """Output DataFrame has expected columns & dtypes."""
     bars = _mk_bars([100.0 + 0.1 * i for i in range(40)])
     out = triple_barrier_labels(bars, k_up=1.0, k_dn=1.0, T=5, atr_window=5)
-    for c in ("atr", "label", "hit_offset", "realized_ret", "realized_ret_pts"):
+    for c in ("atr", "label", "hit_offset", "realized_ret", "realized_ret_pts", "halt_truncated"):
         assert c in out.columns
     assert out.schema["label"] == pl.Int8
     assert out.schema["hit_offset"] == pl.Int32
     assert out.schema["realized_ret"] == pl.Float64
     assert out.schema["realized_ret_pts"] == pl.Float64
+    assert out.schema["halt_truncated"] == pl.Boolean
     assert out.height == bars.height
 
 
@@ -191,7 +192,7 @@ def test_realized_ret_pts_matches_barrier_distance():
     low = np.array([99.5, 100.0, 100.5, 101.5, 102.5])
     open_ = close.copy()
     atr = np.array([1.0] * 5)
-    labels, _, _, rets_pts = _triple_barrier_np(
+    labels, _, _, rets_pts, _ = _triple_barrier_np(
         close, high, low, open_, atr, k_up=1.5, k_dn=1.5, T=4
     )
     # i=0: +1 label; upper=101.5 → rets_pts = 101.5 - 100.0 = 1.5 = k_up*atr
@@ -461,3 +462,61 @@ def test_triple_barrier_labels_halt_aware_off_keeps_halt_crossing_bars():
     out = triple_barrier_labels(bars, k_up=1.5, k_dn=1.5, T=4, atr_window=3, halt_aware=False)
     # No bars should be marked halt-dropped
     assert (out["hit_offset"] == -1).sum() == 0
+
+
+def _mk_pre_halt_bars(pre_halt_n: int, post_halt_n: int):
+    """15-min bar series with `pre_halt_n` bars, a 60-min halt, then `post_halt_n` bars.
+
+    Bars rise smoothly so a tight upper barrier is hittable before halt.
+    """
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    ts = [start + timedelta(minutes=15 * i) for i in range(pre_halt_n)]
+    halt_end = ts[-1] + timedelta(minutes=60)
+    ts += [halt_end + timedelta(minutes=15 * i) for i in range(post_halt_n)]
+    n = len(ts)
+    closes = [100.0 + 0.1 * i for i in range(n)]
+    return pl.DataFrame({
+        "ts": ts,
+        "open": closes,
+        "high": [c + 0.3 for c in closes],
+        "low": [c - 0.3 for c in closes],
+        "close": closes,
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+
+def test_triple_barrier_labels_halt_truncate_keeps_short_horizon_labels():
+    """halt_mode='truncate': bar 1 step before halt with T=4 gets effective T=1
+    (below default min_effective_T=2 → dropped); but bar earlier with effective
+    T >= min_effective_T is kept and marked halt_truncated=True."""
+    bars = _mk_pre_halt_bars(pre_halt_n=10, post_halt_n=5)
+    out = triple_barrier_labels(
+        bars, k_up=1.5, k_dn=1.5, T=4, atr_window=3,
+        halt_aware=True, halt_mode="truncate", min_effective_T=2,
+    )
+    # The bar at index 6 has forward calendar window 7,8,9, then 10=post-halt.
+    # j_halt=10, effective_T = 10-1 - 6 = 3 (>=2, kept truncated).
+    # The bar at index 9 (last pre-halt) has forward window 10..13 all post-halt;
+    # j_halt=10, effective_T = 10-1 - 9 = 0 (<2, dropped).
+    # The bar at index 8: j_halt=10, effective_T = 1 (<2, dropped).
+    assert out["hit_offset"][9] == -1, "last pre-halt bar should be dropped (effective T = 0)"
+    assert out["hit_offset"][8] == -1, "second-to-last pre-halt bar dropped (effective T = 1)"
+    # Bar 6 with effective T = 3 should be kept and marked truncated
+    assert out["halt_truncated"][6], "bar 6 should be truncated (effective T = 3, >= min)"
+    assert out["hit_offset"][6] != -1
+
+
+def test_triple_barrier_labels_halt_truncate_no_halt_no_truncation():
+    """When forward window doesn't cross a halt, halt_truncated=False everywhere."""
+    bars = _mk_pre_halt_bars(pre_halt_n=20, post_halt_n=0)
+    out = triple_barrier_labels(
+        bars, k_up=1.5, k_dn=1.5, T=4, atr_window=3,
+        halt_aware=True, halt_mode="truncate", min_effective_T=2,
+    )
+    assert not out["halt_truncated"].any(), \
+        "no bars should be marked halt_truncated when no halt is in forward window"
+
+
+def test_triple_barrier_labels_invalid_halt_mode():
+    bars = _mk_bars([100.0 + 0.1 * i for i in range(20)])
+    with pytest.raises(ValueError, match="halt_mode"):
+        triple_barrier_labels(bars, halt_mode="bogus")

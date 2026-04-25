@@ -105,25 +105,34 @@ def _triple_barrier_np(
     T: int,
     ts_seconds: np.ndarray | None = None,
     halt_gap_seconds: int = 1800,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (labels, hit_bar_offset, realized_log_return, realized_ret_pts).
+    halt_mode: str = "drop",
+    min_effective_T: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (labels, hit_bar_offset, realized_log_return, realized_ret_pts, truncated).
 
-    hit_bar_offset: bars from label_row until barrier hit (or T if time-expired).
-    realized_log_return: log(barrier_price / close[i]) for ±1; log(close[i+T]/close[i]) for 0.
-    realized_ret_pts: absolute price diff (barrier_price − close[i]) in instrument
-        price units — i.e., ES points, NQ points, etc. Used downstream to evaluate
-        whether a vol-scaled barrier is tradeable after costs.
+    hit_bar_offset: bars from label_row until barrier hit (or effective T if time-expired);
+        -1 sentinel means dropped (warmup, halt-cross with drop mode, or effective T below floor).
+    realized_log_return: log(barrier_price / close[i]) for ±1; log(close[i+effT]/close[i]) for 0.
+    realized_ret_pts: absolute price diff in instrument points.
+    truncated: bool array — True iff the bar was halt-truncated to a shorter effective T.
 
-    If ts_seconds is provided, bars whose forward T-window crosses a halt
-    (consecutive ts gap > halt_gap_seconds, default 30min) are marked
-    unlabelable: realized_ret stays NaN so the row is filtered downstream.
-    Without ts_seconds, halt detection is skipped (legacy behavior).
+    Halt handling (only when ts_seconds is provided):
+      halt_mode='drop' (legacy): bars whose forward T-window crosses a halt
+        (ts gap > halt_gap_seconds, default 30min) are marked unlabelable.
+      halt_mode='truncate': effective T is shrunk to fit before the halt. If
+        the effective T is below `min_effective_T`, the bar is dropped (too
+        short to be meaningful). Truncated bars get truncated=True so
+        downstream weighting can account for the shorter horizon.
     """
+    if halt_mode not in ("drop", "truncate"):
+        raise ValueError(f"halt_mode must be 'drop' or 'truncate'; got {halt_mode!r}")
+
     n = len(close)
     labels = np.zeros(n, dtype=np.int8)
     offsets = np.zeros(n, dtype=np.int32)
     rets = np.full(n, np.nan, dtype=np.float64)
     rets_pts = np.full(n, np.nan, dtype=np.float64)
+    truncated = np.zeros(n, dtype=bool)
 
     for i in range(n):
         if np.isnan(atr[i]):
@@ -131,22 +140,33 @@ def _triple_barrier_np(
             offsets[i] = 0
             continue
 
-        # Halt-aware: if the forward T-window crosses any halt boundary, drop this bar.
+        # Effective forward window (may shrink to fit pre-halt window).
+        forward_end = min(i + T + 1, n)
+        is_truncated = False
+
         if ts_seconds is not None:
-            forward_end = min(i + T + 1, n)
-            crosses_halt = False
+            # Find the first halt boundary in the forward window.
+            j_halt = -1
             for j in range(i + 1, forward_end):
                 if ts_seconds[j] - ts_seconds[j - 1] > halt_gap_seconds:
-                    crosses_halt = True
+                    j_halt = j
                     break
-            if crosses_halt:
-                # leave label=0, ret=NaN — downstream filter drops it
-                offsets[i] = -1
-                continue
+            if j_halt != -1:
+                if halt_mode == "drop":
+                    offsets[i] = -1
+                    continue
+                # truncate: effective horizon ends at the last bar before halt
+                effective_T = (j_halt - 1) - i
+                if effective_T < min_effective_T:
+                    offsets[i] = -1
+                    continue
+                forward_end = j_halt  # don't search past pre-halt bars
+                is_truncated = True
 
+        truncated[i] = is_truncated
         upper = close[i] + k_up * atr[i]
         lower = close[i] - k_dn * atr[i]
-        j_max = min(i + T + 1, n)
+        j_max = forward_end
 
         hit_up = -1
         hit_dn = -1
@@ -202,7 +222,7 @@ def _triple_barrier_np(
                     offsets[i] = j - i
                     rets[i] = np.log(lower / close[i])
                     rets_pts[i] = lower - close[i]
-    return labels, offsets, rets, rets_pts
+    return labels, offsets, rets, rets_pts, truncated
 
 
 def triple_barrier_labels(
@@ -215,6 +235,8 @@ def triple_barrier_labels(
     lookback_days: int = 30,
     bar_minutes: int = 15,
     halt_aware: bool = True,
+    halt_mode: str = "drop",
+    min_effective_T: int = 2,
     open_col: str = "open",
     high_col: str = "high",
     low_col: str = "low",
@@ -232,13 +254,19 @@ def triple_barrier_labels(
             atr_mode='time_conditional').
         bar_minutes: bar duration in minutes (15 for 15-min bars). Defines the
             bar-of-day index for TC ATR.
-        halt_aware: if True (default), bars whose forward T-window crosses a
-            CME halt (>30min ts gap) are marked unlabelable (label=0, ret=NaN,
-            offset=-1). Filter `realized_ret.is_finite()` to drop them.
+        halt_aware: if True (default), enable halt detection from ts gaps.
+        halt_mode: when halt_aware=True, controls the policy for bars whose
+            forward T-window crosses a CME halt (>30min ts gap):
+              - "drop" (default): mark the bar unlabelable.
+              - "truncate": shrink the effective horizon to fit pre-halt;
+                drop only if the effective horizon is below `min_effective_T`.
+        min_effective_T: floor on the effective horizon when halt_mode='truncate'.
+            Default 2 bars (~30min at 15-min cadence).
 
     Returns the original frame with appended columns:
-        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32; -1 = halt-dropped),
-        realized_ret (Float64, log return), realized_ret_pts (Float64, price pts).
+        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32; -1 = dropped),
+        realized_ret (Float64, log return), realized_ret_pts (Float64, price pts),
+        halt_truncated (Boolean; True iff the bar's horizon was halt-truncated).
     """
     if atr_mode == "calendar":
         df = bars.with_columns(
@@ -265,8 +293,9 @@ def triple_barrier_labels(
         df[ts_col].dt.epoch(time_unit="s").to_numpy().astype(np.int64) if halt_aware else None
     )
 
-    labels, offsets, rets, rets_pts = _triple_barrier_np(
-        close, high, low, open_, atr, k_up, k_dn, T, ts_seconds=ts_seconds
+    labels, offsets, rets, rets_pts, truncated = _triple_barrier_np(
+        close, high, low, open_, atr, k_up, k_dn, T,
+        ts_seconds=ts_seconds, halt_mode=halt_mode, min_effective_T=min_effective_T,
     )
 
     return df.with_columns(
@@ -275,6 +304,7 @@ def triple_barrier_labels(
             pl.Series("hit_offset", offsets, dtype=pl.Int32),
             pl.Series("realized_ret", rets, dtype=pl.Float64),
             pl.Series("realized_ret_pts", rets_pts, dtype=pl.Float64),
+            pl.Series("halt_truncated", truncated, dtype=pl.Boolean),
         ]
     )
 

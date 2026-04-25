@@ -134,7 +134,11 @@ def main() -> int:
     p.add_argument("--lookback-days", type=int, default=30,
                    help="Lookback days for time_conditional ATR")
     p.add_argument("--halt-aware", action="store_true", default=True,
-                   help="Drop bars whose forward T-window crosses a halt (>30min ts gap)")
+                   help="Detect bars whose forward T-window crosses a halt (>30min ts gap)")
+    p.add_argument("--halt-mode", default="drop", choices=["drop", "truncate"],
+                   help="Policy for halt-crossing bars: drop or truncate forward window")
+    p.add_argument("--min-effective-T", type=int, default=2,
+                   help="Floor on truncated effective T (bars below this get dropped)")
     args = p.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -145,7 +149,8 @@ def main() -> int:
     params = V1_PARAMS[args.instrument]
     print(f"[diag] {args.instrument}  params={params}  IS=[{start} .. {end}]  "
           f"atr_mode={args.atr_mode}  lookback_days={args.lookback_days}  "
-          f"halt_aware={args.halt_aware}")
+          f"halt_aware={args.halt_aware}  halt_mode={args.halt_mode}  "
+          f"min_eff_T={args.min_effective_T}")
 
     bars = _load_bars(args.bars_glob)
     bars = bars.filter(
@@ -158,6 +163,8 @@ def main() -> int:
         atr_mode=args.atr_mode,
         lookback_days=args.lookback_days,
         halt_aware=args.halt_aware,
+        halt_mode=args.halt_mode,
+        min_effective_T=args.min_effective_T,
     )
     diag = per_hour_stats(labeled)
 
