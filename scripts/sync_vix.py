@@ -63,11 +63,19 @@ def s3_ls(prefix: str) -> list[tuple[str, int]]:
 
 
 def s3_cp(key: str, dest: Path) -> tuple[bool, str]:
+    """Download s3://{BUCKET}/{key} → dest.
+
+    Uses `aws s3api get-object` instead of `aws s3 cp` because the latter does
+    an internal HeadObject call that does NOT consistently propagate
+    --request-payer requester (AWS CLI behavior; reproducible 403 Forbidden
+    on requester-pays buckets despite --request-payer being on the cp command).
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "aws", "s3", "cp", f"s3://{BUCKET}/{key}", str(dest),
+        "aws", "s3api", "get-object",
+        "--bucket", BUCKET, "--key", key,
         "--profile", PROFILE, "--request-payer", "requester",
-        "--only-show-errors",
+        str(dest),
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=600)
     if out.returncode != 0:

@@ -55,11 +55,13 @@ def build_day(
         raise FileNotFoundError(str(cf.path))
     taq = read_taq(cf)
     trades, quotes = split_trades_quotes(taq)
-    if trades.height == 0:
-        raise ValueError(f"zero trades in {cf.path}")
+    if trades.height == 0 or len(quotes) == 0:
+        # Zero-trade or zero-quote days (holidays, halts) — soft skip.
+        # Not an error; caller treats as no-build instead of fatal.
+        return 0, 0
     bars_5s = build_5sec_bars_core(trades, quotes, root=instr, expiry=expiry, every="5s")
     if bars_5s.height == 0:
-        raise ValueError(f"zero 5s bars in {cf.path}")
+        return 0, 0  # also a soft skip
     bars = downsample_bars(bars_5s, target_every=horizon)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bars.write_parquet(out_path, compression="zstd", compression_level=3)
@@ -98,7 +100,7 @@ def main() -> int:
     out_root = Path(args.out_root)
     algoseek_root = Path(args.algoseek_root) if args.algoseek_root else None
 
-    n_ok = n_skip = n_err = 0
+    n_ok = n_skip = n_err = n_empty = 0
     errors: list[str] = []
 
     for fc in iter_front_series(args.instrument, start, end, dataset="taq",
@@ -112,8 +114,12 @@ def main() -> int:
                 args.instrument, fc.expiry, fc.day, args.horizon, out,
                 algoseek_root=algoseek_root,
             )
-            n_ok += 1
-            print(f"[ok]   {fc.day}  {fc.expiry}  trades={n_trades:,}  bars={n_bars}  → {out.name}")
+            if n_trades == 0:
+                n_empty += 1
+                print(f"[empty] {fc.day}  {fc.expiry}  zero trades/bars (holiday or halt)")
+            else:
+                n_ok += 1
+                print(f"[ok]    {fc.day}  {fc.expiry}  trades={n_trades:,}  bars={n_bars}  → {out.name}")
         except Exception as e:
             n_err += 1
             msg = f"[err]  {fc.day}  {fc.expiry}  {type(e).__name__}: {e}"
@@ -122,7 +128,10 @@ def main() -> int:
             traceback.print_exc(file=sys.stderr)
 
     print(f"\n[summary] {args.instrument} [{start}..{end}] horizon={args.horizon}")
-    print(f"  built={n_ok}  skipped={n_skip}  errors={n_err}")
+    print(f"  built={n_ok}  empty(holiday)={n_empty}  skipped(already-have)={n_skip}  errors={n_err}")
+    # Empty days are NOT failures (holidays, halts); they're expected.
+    # Genuinely-broken files (read errors, schema mismatch) still bubble up
+    # as exceptions and exit non-zero — keeps the dependency chain honest.
     return 0 if n_err == 0 else 1
 
 
