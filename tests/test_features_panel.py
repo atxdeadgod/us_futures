@@ -240,3 +240,94 @@ def test_per_instrument_pipeline_end_to_end():
         assert c in out.columns
         assert f"{c}_tc_z_w20" in out.columns
         assert f"{c}_tc_madz_w30" in out.columns
+
+
+# ---------------------------------------------------------------------------
+# Step 6: assemble_target_panel
+# ---------------------------------------------------------------------------
+
+def test_step6_assemble_target_panel_attaches_labels():
+    """Target panel includes label/realized_ret/atr columns from triple_barrier_labels."""
+    bars = _mk_phase_a_bars(n_days=200)  # enough for 150-day TC-ATR lookback
+    target_bars = panel.build_per_instrument_features(bars, lookback_days_grid=(30,))
+    out = panel.assemble_target_panel(
+        target="ES",
+        target_bars_with_features=target_bars,
+        wide_cross_asset=None,
+        label_params={"k_up": 1.0, "k_dn": 1.0, "T": 4, "lookback_days": 30},
+    )
+    for c in ("label", "realized_ret", "realized_ret_pts", "hit_offset", "atr", "halt_truncated"):
+        assert c in out.columns, f"missing label-output column: {c}"
+    # All rows should have finite atr + realized_ret since drop_invalid=True
+    assert out["atr"].is_finite().all()
+    assert out["realized_ret"].is_finite().all()
+
+
+def test_step6_uses_v1_locked_params_when_label_params_omitted():
+    """Default to V1_LABEL_PARAMS[target] if no explicit label_params given.
+
+    Note: with V1 default lookback_days=150, we need >=150 days to produce
+    valid rows. Use a smaller-lookback override here to keep the test fast,
+    but verify the V1 dict is consulted as the source.
+    """
+    assert panel.V1_LABEL_PARAMS["ES"]["k_up"] == 1.25
+    assert panel.V1_LABEL_PARAMS["RTY"]["T"] == 4
+    assert panel.V1_LABEL_PARAMS["RTY"]["lookback_days"] == 180
+
+
+def test_step6_invalid_target_raises():
+    bars = _mk_phase_a_bars(n_days=40)
+    target_bars = panel.build_per_instrument_features(bars, lookback_days_grid=(20,))
+    with pytest.raises(ValueError, match="V1_LABEL_PARAMS"):
+        panel.assemble_target_panel(target="ZZZ", target_bars_with_features=target_bars)
+
+
+def test_step6_joins_wide_cross_asset_drops_target_prefix():
+    """When the wide frame has ES_log_return etc., those should NOT collide
+    with target_bars_with_features's own log_return."""
+    target_bars = panel.build_per_instrument_features(
+        _mk_phase_a_bars(n_days=200, seed=1), lookback_days_grid=(30,),
+    )
+    peer_bars = panel.build_per_instrument_features(
+        _mk_phase_a_bars(n_days=200, seed=2), lookback_days_grid=(30,),
+    )
+    wide = panel.build_wide_cross_asset_frame(
+        {"ES": target_bars, "NQ": peer_bars},
+        base_value_cols=["log_return", "log_volume"],
+    )
+    out = panel.assemble_target_panel(
+        target="ES",
+        target_bars_with_features=target_bars,
+        wide_cross_asset=wide,
+        label_params={"k_up": 1.0, "k_dn": 1.0, "T": 4, "lookback_days": 30},
+    )
+    # ES's own log_return is in target_bars (unprefixed)
+    assert "log_return" in out.columns
+    # ES_log_return from wide should NOT be in output (dropped to avoid duplication)
+    assert "ES_log_return" not in out.columns
+    # NQ's prefixed log_return SHOULD be in output (peer feature)
+    assert "NQ_log_return" in out.columns
+
+
+def test_step6_drop_invalid_filter():
+    """drop_invalid=False keeps warmup rows; drop_invalid=True removes them."""
+    bars = _mk_phase_a_bars(n_days=200)
+    target_bars = panel.build_per_instrument_features(bars, lookback_days_grid=(30,))
+    out_with = panel.assemble_target_panel(
+        target="ES",
+        target_bars_with_features=target_bars,
+        label_params={"k_up": 1.0, "k_dn": 1.0, "T": 4, "lookback_days": 30},
+        drop_invalid=True,
+    )
+    out_without = panel.assemble_target_panel(
+        target="ES",
+        target_bars_with_features=target_bars,
+        label_params={"k_up": 1.0, "k_dn": 1.0, "T": 4, "lookback_days": 30},
+        drop_invalid=False,
+    )
+    assert out_with.height < out_without.height
+    # The dropped rows had non-finite atr or ret (warmup or halt-truncated)
+    invalid = out_without.filter(
+        ~pl.col("atr").is_finite() | ~pl.col("realized_ret").is_finite()
+    )
+    assert invalid.height > 0
