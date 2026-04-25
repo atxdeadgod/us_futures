@@ -43,6 +43,10 @@ def _mk_phase_a_bars(n_days: int = 5, seed: int = 0) -> pl.DataFrame:
             cvd += (buys - sells) / 100.0
             mid = (px + 0.05 + px - 0.05) / 2  # mid ~ close
             spread = 0.25 + max(0, rng.normal(0, 0.05))
+            implied_vol = max(0, int(volume * 0.15 + rng.normal(0, 5)))
+            implied_buys = int(implied_vol * (0.5 + rng.normal(0, 0.05)))
+            implied_buys = max(0, min(implied_vol, implied_buys))
+            implied_sells = implied_vol - implied_buys
             rows.append(dict(
                 ts=ts, open=px, high=high, low=low, close=px, volume=volume,
                 dollar_volume=px * volume,
@@ -50,6 +54,7 @@ def _mk_phase_a_bars(n_days: int = 5, seed: int = 0) -> pl.DataFrame:
                 bid_close=mid - spread / 2, ask_close=mid + spread / 2,
                 mid_close=mid, spread_abs_close=spread,
                 spread_mean_sub=spread, spread_std_sub=max(1e-6, abs(rng.normal(0, 0.02))),
+                implied_volume=implied_vol, implied_buys=implied_buys, implied_sells=implied_sells,
                 cvd_globex=cvd,
             ))
     return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
@@ -113,6 +118,29 @@ def test_step1_realized_vol_warmup():
     later = [v for v in rv[25:] if v is not None]
     assert len(later) > 0
     assert all(v >= 0 for v in later)
+
+
+def test_step1_implied_volume_share_in_unit_interval():
+    """T1.39: implied_volume_share = implied_volume / volume ∈ [0, 1]."""
+    bars = _mk_phase_a_bars(n_days=3)
+    out = panel.attach_base_microstructure_features(bars)
+    valid = out["implied_volume_share"].drop_nulls().to_list()
+    assert all(0.0 - 1e-9 <= v <= 1.0 + 1e-9 for v in valid)
+
+
+def test_step1_implied_aggressor_skew_in_minus_one_to_one():
+    bars = _mk_phase_a_bars(n_days=3)
+    out = panel.attach_base_microstructure_features(bars)
+    valid = out["implied_aggressor_skew"].drop_nulls().to_list()
+    assert all(-1.0 - 1e-9 <= v <= 1.0 + 1e-9 for v in valid)
+
+
+def test_step1_implied_features_skip_silently_without_inputs():
+    """If implied_* cols absent, no implied_* output cols are added."""
+    bars = _mk_phase_a_bars(n_days=2).drop(["implied_volume", "implied_buys", "implied_sells"])
+    out = panel.attach_base_microstructure_features(bars)
+    assert "implied_volume_share" not in out.columns
+    assert "implied_aggressor_skew" not in out.columns
 
 
 def test_step1_cvd_change_first_is_null():
@@ -429,6 +457,74 @@ def test_per_instrument_pipeline_attach_overnight_off():
     assert "is_rth" in out.columns
     # Overnight columns NOT added
     assert "overnight_log_return" not in out.columns
+
+
+def _mk_phase_e_bars(n_bars: int = 96, seed: int = 7) -> pl.DataFrame:
+    """Synthetic Phase E aggregates aligned to the _mk_phase_a_bars timing."""
+    rng = np.random.default_rng(seed)
+    base = datetime(2024, 3, 4, 0, 0, tzinfo=timezone.utc)
+    rows = []
+    for b in range(n_bars):
+        ts = base + timedelta(minutes=15 * b)
+        eff_w = max(1, int(rng.normal(800, 100)))
+        rows.append(dict(
+            ts=ts,
+            eff_spread_sum=eff_w * 0.25,
+            eff_spread_weight=eff_w,
+            eff_spread_count=eff_w // 5,
+            eff_spread_buy_sum=eff_w * 0.13,
+            eff_spread_buy_weight=eff_w // 2,
+            eff_spread_sell_sum=eff_w * 0.12,
+            eff_spread_sell_weight=eff_w // 2,
+            n_large_trades=int(rng.poisson(2)),
+            large_trade_volume=int(rng.poisson(2) * 50),
+            hidden_absorption_volume=int(abs(rng.normal(20, 10))),
+            hidden_absorption_trades=int(abs(rng.normal(2, 1))),
+            net_bid_decrement_no_trade_L1=int(abs(rng.normal(15, 5))),
+            net_ask_decrement_no_trade_L1=int(abs(rng.normal(15, 5))),
+            quote_update_count=int(rng.normal(400, 80)),
+        ))
+    return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+
+def test_attach_phase_e_features_emits_expected_columns():
+    bars = _mk_phase_a_bars(n_days=2)
+    pe = _mk_phase_e_bars(n_bars=192)  # 2 days × 96 bars
+    out = panel.attach_phase_e_features(bars, pe)
+    expected = [
+        "vwap_eff_spread", "vwap_eff_spread_buy", "vwap_eff_spread_sell",
+        "eff_spread_asymmetry",
+        "large_trade_volume_share", "n_large_trades_log",
+        "cancel_to_trade_ratio", "quote_to_trade_ratio",
+        "hidden_absorption_ratio_w30",
+    ]
+    for c in expected:
+        assert c in out.columns, f"missing Phase E col: {c}"
+
+
+def test_attach_phase_e_features_handles_ts_dtype_mismatch():
+    """If phase_e_bars have datetime[μs] and target bars have datetime[ns], the
+    function should coerce before asof-join (no SchemaError)."""
+    bars = _mk_phase_a_bars(n_days=2)
+    pe = _mk_phase_e_bars(n_bars=192).with_columns(pl.col("ts").cast(pl.Datetime("us", "UTC")))
+    out = panel.attach_phase_e_features(bars, pe)
+    # at least some rows should have non-null Phase E features after asof-join
+    assert out["vwap_eff_spread"].drop_nulls().len() > 0
+
+
+def test_attach_phase_e_features_eff_spread_sign_correct():
+    """vwap_eff_spread should be eff_spread_sum / eff_spread_weight (positive when
+    aggressor flow paid the spread)."""
+    bars = _mk_phase_a_bars(n_days=2)
+    pe = _mk_phase_e_bars(n_bars=192)
+    out = panel.attach_phase_e_features(bars, pe)
+    # Sample checks: where eff_spread_weight > 0, computed vwap = sum/weight
+    pos = out.filter(pl.col("eff_spread_weight") > 0).select(
+        ["eff_spread_sum", "eff_spread_weight", "vwap_eff_spread"]
+    ).head(5)
+    for row in pos.iter_rows(named=True):
+        expected = row["eff_spread_sum"] / (row["eff_spread_weight"] + 1e-9)
+        assert abs(expected - row["vwap_eff_spread"]) < 1e-6
 
 
 def test_attach_pattern_features_emits_expected_columns():

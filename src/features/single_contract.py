@@ -44,6 +44,8 @@ BASE_VALUE_COLS = [
     "log_return", "abs_log_return", "log_volume",
     "ofi", "aggressor_ratio", "cvd_change", "net_aggressor_volume",
     "average_trade_size", "trades_count_log",
+    # Implied volume (T1.39) — derived from Algoseek implied_* Phase A cols
+    "implied_volume_share", "implied_aggressor_skew",
     # Spread
     "spread_to_mid_bps", "spread_sub_var_ratio",
     # Realized vol family
@@ -137,6 +139,16 @@ def attach_base_microstructure_features(
     if {"spread_std_sub", "spread_mean_sub"}.issubset(cols):
         pass1.append(
             (pl.col("spread_std_sub") / (pl.col("spread_mean_sub") + EPS)).alias("spread_sub_var_ratio")
+        )
+    if {"implied_volume", "implied_buys", "implied_sells"}.issubset(cols):
+        # T1.39 ImpliedVolumeShare: fraction of bar volume that's implied (CME spreader fills)
+        pass1.append(
+            (pl.col("implied_volume") / (pl.col("volume") + EPS)).alias("implied_volume_share")
+        )
+        # Within implied volume, what's the buy/sell skew? Range [-1, 1].
+        pass1.append(
+            ((pl.col("implied_buys") - pl.col("implied_sells"))
+             / (pl.col("implied_volume") + EPS)).alias("implied_aggressor_skew")
         )
     df = bars.with_columns(pass1).with_columns([
         pl.col("log_return").abs().alias("abs_log_return"),
@@ -432,6 +444,102 @@ def attach_engine_features(
         rn = engine_features.round_number_pin_distance(bars[close_col], N=float(N))
         df = df.with_columns(pl.Series(f"round_pin_distance_N{int(N)}", rn))
     return df
+
+
+# ---------------------------------------------------------------------------
+# Phase E features (execution-quality + cancel-proxy + quote-event derived ratios)
+# ---------------------------------------------------------------------------
+
+def attach_phase_e_features(
+    bars: pl.DataFrame,
+    phase_e_bars: pl.DataFrame,
+    ts_col: str = "ts",
+    hidden_absorption_window: int = 30,
+) -> pl.DataFrame:
+    """Asof-join Phase E aggregates onto the bar frame and compute derived ratios.
+
+    Inputs:
+        bars: per-bar futures panel (must have ts, volume, trades_count).
+        phase_e_bars: per-bar Phase E aggregates produced by
+            scripts/build_phase_e_bars.py — has eff_spread_*, n_large_trades,
+            large_trade_volume, hidden_absorption_*, net_*_decrement_no_trade_L1,
+            quote_update_count.
+
+    Adds (when the inputs are present):
+        vwap_eff_spread                 (T1.35) eff_spread_sum / eff_spread_weight
+        vwap_eff_spread_buy             (T1.36) eff_spread_buy_sum / eff_spread_buy_weight
+        vwap_eff_spread_sell            (T1.36) eff_spread_sell_sum / eff_spread_sell_weight
+        eff_spread_asymmetry            (T1.37) buy − sell vwap-eff-spread
+        large_trade_volume_share        (T1.23) large_trade_volume / volume
+        n_large_trades_log              log(1 + n_large_trades) for Gaussian-like scale
+        hidden_absorption_ratio_w{N}    (T1.47/T7.12) rolling sum / rolling sum
+        cancel_to_trade_ratio           (T1.43) (bid + ask) cancel decrement / volume
+        quote_to_trade_ratio            (T1.24) quote_update_count / trades_count
+
+    Coerces phase_e_bars[ts] dtype to match bars[ts] before asof-join.
+    """
+    target_dtype = bars.schema[ts_col]
+    pe_cols = [c for c in phase_e_bars.columns if c != ts_col]
+    pe = (
+        phase_e_bars
+        .with_columns(pl.col(ts_col).cast(target_dtype))
+        .sort(ts_col)
+    )
+    bars = bars.sort(ts_col).join_asof(pe, on=ts_col, strategy="backward")
+
+    derived: list[pl.Expr] = []
+
+    if {"eff_spread_sum", "eff_spread_weight"}.issubset(pe_cols):
+        derived.append(
+            (pl.col("eff_spread_sum") / (pl.col("eff_spread_weight") + EPS))
+                .alias("vwap_eff_spread")
+        )
+    if {"eff_spread_buy_sum", "eff_spread_buy_weight"}.issubset(pe_cols):
+        derived.append(
+            (pl.col("eff_spread_buy_sum") / (pl.col("eff_spread_buy_weight") + EPS))
+                .alias("vwap_eff_spread_buy")
+        )
+    if {"eff_spread_sell_sum", "eff_spread_sell_weight"}.issubset(pe_cols):
+        derived.append(
+            (pl.col("eff_spread_sell_sum") / (pl.col("eff_spread_sell_weight") + EPS))
+                .alias("vwap_eff_spread_sell")
+        )
+    if {"large_trade_volume"}.issubset(pe_cols) and "volume" in bars.columns:
+        derived.append(
+            (pl.col("large_trade_volume") / (pl.col("volume") + EPS))
+                .alias("large_trade_volume_share")
+        )
+    if "n_large_trades" in pe_cols:
+        derived.append((1 + pl.col("n_large_trades")).log().alias("n_large_trades_log"))
+    if {"net_bid_decrement_no_trade_L1", "net_ask_decrement_no_trade_L1"}.issubset(pe_cols) \
+            and "volume" in bars.columns:
+        derived.append(
+            ((pl.col("net_bid_decrement_no_trade_L1") + pl.col("net_ask_decrement_no_trade_L1"))
+             / (pl.col("volume") + EPS)).alias("cancel_to_trade_ratio")
+        )
+    if "quote_update_count" in pe_cols and "trades_count" in bars.columns:
+        derived.append(
+            (pl.col("quote_update_count") / (pl.col("trades_count") + EPS))
+                .alias("quote_to_trade_ratio")
+        )
+
+    bars = bars.with_columns(derived)
+
+    # Symmetric eff-spread asymmetry — depends on pass-1 buy/sell vwap cols.
+    if "vwap_eff_spread_buy" in bars.columns and "vwap_eff_spread_sell" in bars.columns:
+        bars = bars.with_columns(
+            (pl.col("vwap_eff_spread_buy") - pl.col("vwap_eff_spread_sell"))
+                .alias("eff_spread_asymmetry")
+        )
+
+    # Hidden-absorption rolling ratio (T1.47 / T7.12 prerequisite)
+    if "hidden_absorption_volume" in pe_cols and "volume" in bars.columns:
+        bars = bars.with_columns(
+            (pl.col("hidden_absorption_volume").rolling_sum(window_size=hidden_absorption_window)
+             / (pl.col("volume").rolling_sum(window_size=hidden_absorption_window) + EPS))
+                .alias(f"hidden_absorption_ratio_w{hidden_absorption_window}")
+        )
+    return bars
 
 
 # ---------------------------------------------------------------------------

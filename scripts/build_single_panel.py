@@ -38,7 +38,7 @@ def _print_col_summary(feat: pl.DataFrame) -> None:
     grouped: dict[str, list[str]] = {
         "base": [], "norm_tc_z": [], "norm_madz": [],
         "L2_deep": [], "L2_per_level": [],
-        "patterns": [], "engines": [], "sub_bar_engines": [],
+        "patterns": [], "engines": [], "sub_bar_engines": [], "phase_e": [],
         "vx": [], "gex": [],
         "ema_smoothed": [], "session/cyclic/overnight": [], "labels/identity": [],
     }
@@ -62,6 +62,15 @@ def _print_col_summary(feat: pl.DataFrame) -> None:
             grouped["patterns"].append(c)
         elif c.startswith("fracdiff_") or c.startswith("round_pin_"): grouped["engines"].append(c)
         elif c.startswith("vpin") or c.startswith("hawkes_"): grouped["sub_bar_engines"].append(c)
+        elif c.startswith("eff_spread_") or c.startswith("vwap_eff_spread") \
+            or c == "eff_spread_asymmetry" \
+            or c in ("n_large_trades", "n_large_trades_log", "large_trade_volume",
+                      "large_trade_volume_share",
+                      "hidden_absorption_volume", "hidden_absorption_trades",
+                      "net_bid_decrement_no_trade_L1", "net_ask_decrement_no_trade_L1",
+                      "cancel_to_trade_ratio", "quote_update_count", "quote_to_trade_ratio") \
+            or c.startswith("hidden_absorption_ratio_w"):
+            grouped["phase_e"].append(c)
         elif c.startswith("gex_") or c in ("total_gex", "gex_sign", "distance_to_zero_gamma_flip",
                                              "distance_to_max_call_oi", "distance_to_max_put_oi"):
             grouped["gex"].append(c)

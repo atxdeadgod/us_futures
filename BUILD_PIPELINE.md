@@ -19,6 +19,7 @@ ssh bigred 'cd ~/us_futures && sbatch scripts/build_phase_a_bars.sbatch'      # 
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_l2_bars.sbatch'           # ES/NQ/RTY/YM Phase A+B (~3h, array of 4)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_vx_bars.sbatch'           # VX1/VX2/VX3 15m       (~75min)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_5sec_bars.sbatch'         # ES 5-sec (for VPIN/Hawkes; ~60min)
+ssh bigred 'cd ~/us_futures && sbatch scripts/build_phase_e_bars.sbatch'      # ES Phase E exec/cancel/quote-count (~2h)
 
 # Phase 2a: GEX daily profile (depends on SPX options chain at /N/.../spx_options_chain/)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_gex_features.sbatch'      # SPX+SPY × 5 yrs  (~15min, array of 10)
@@ -116,9 +117,16 @@ input dependencies. SLURM array tasks are independent days × instruments.
 ### S4. 5-sec bars (ES, for sub-bar engines)
 - **Reads**: same as Phase A.
 - **Writes**: `bars_5sec/ES/5s/ES_{YYYYMMDD}_5s.parquet` (~15K rows/day × 29 cols).
-- **Used by**: VPIN volume buckets, Hawkes intensity recursion, sub-bar realized moments. **Not currently consumed by `build_es_panel.py` — V1.5 wiring needed.**
+- **Used by**: VPIN volume buckets (`engines.vpin_volume_buckets`), Hawkes intensity recursion (`engines.hawkes_intensity_recursive`); wired into `build_futures_panel.py` via `sub_bar_engines.attach_sub_bar_engine_features`.
 - **Script**: `scripts/build_5sec_bars.py`, `build_5sec_bars.sbatch`.
-- **Status**: 🟡 queued (job 6921629).
+- **Status**: ✅ done (1299 days for ES).
+
+### S4b. Phase E bars (ES, execution-quality + cancel-proxy + quote-event aggregates)
+- **Reads**: raw TAQ + depth (Algoseek).
+- **Writes**: `bars_phase_e/ES/15m/ES_{YYYYMMDD}_15m.parquet` (14 cols).
+- **Cols**: eff_spread_{sum,weight,count,buy_*,sell_*}, n_large_trades, large_trade_volume, hidden_absorption_{volume,trades}, net_{bid,ask}_decrement_no_trade_L1, quote_update_count.
+- **Used by**: `single_contract.attach_phase_e_features` to derive vwap_eff_spread + asymmetry (T1.35-T1.37), large_trade_volume_share (T1.23), hidden_absorption_ratio (T1.47/T7.12), cancel_to_trade_ratio (T1.43), quote_to_trade_ratio (T1.24).
+- **Script**: `scripts/build_phase_e_bars.py`, `build_phase_e_bars.sbatch`.
 
 ### S5. GEX daily profile (SPX, SPY)
 - **Reads**: `spx_options_chain/{TICKER}_{YEAR}.parquet` (WRDS OptionMetrics).

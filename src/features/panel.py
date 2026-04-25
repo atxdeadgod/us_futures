@@ -35,6 +35,7 @@ from .single_contract import (
     attach_engine_features,
     attach_l2_deep_features,
     attach_pattern_features,
+    attach_phase_e_features,
     attach_ts_normalizations,
     build_per_instrument_features,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "attach_engine_features",
     "attach_l2_deep_features",
     "attach_pattern_features",
+    "attach_phase_e_features",
     "attach_ts_normalizations",
     "build_per_instrument_features",
     # external_sources

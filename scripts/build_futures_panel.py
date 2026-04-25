@@ -54,12 +54,16 @@ def main() -> int:
     p.add_argument("--bars-phase-ab-root", default="/N/project/ksb-finance-backtesting/data/bars_phase_ab")
     p.add_argument("--bars-5s-root", default="/N/project/ksb-finance-backtesting/data/bars_5sec",
                    help="Root for 5-sec bars (used for VPIN + Hawkes engines). Skip if not present.")
+    p.add_argument("--bars-phase-e-root", default="/N/project/ksb-finance-backtesting/data/bars_phase_e",
+                   help="Root for Phase E bars (eff spread, large-trade, hidden, cancel, quote count).")
     p.add_argument("--horizon", default="15m")
     p.add_argument("--no-l2-deep", action="store_true",
                    help="Skip L2-deep features (use Phase A only)")
     p.add_argument("--no-vx", action="store_true")
     p.add_argument("--no-sub-bar-engines", action="store_true",
                    help="Skip VPIN + Hawkes (sub-bar engine) features")
+    p.add_argument("--no-phase-e", action="store_true",
+                   help="Skip Phase E (execution-quality + cancel-proxy + quote-event) features")
     p.add_argument("--vpin-bucket-size", type=int, default=25_000)
     p.add_argument("--hawkes-hl-fast", type=float, default=5.0)
     p.add_argument("--hawkes-hl-slow", type=float, default=60.0)
@@ -120,6 +124,17 @@ def main() -> int:
             print(f"  after sub-bar engines: cols={len(feat.columns)}")
         except FileNotFoundError as e:
             print(f"  [skip-sub-bar] {e}")
+
+    if not args.no_phase_e:
+        bars_phase_e_root = Path(args.bars_phase_e_root)
+        try:
+            print(f"[features] Phase E (eff spread + large-trade + hidden + cancel + quote count) from {bars_phase_e_root}")
+            phase_e_bars = _stitch_per_day_parquets(bars_phase_e_root, args.instrument, args.horizon, args.year)
+            print(f"  loaded {phase_e_bars.height:,} Phase E bars  cols={len(phase_e_bars.columns)}")
+            feat = single_contract.attach_phase_e_features(feat, phase_e_bars)
+            print(f"  after Phase E: cols={len(feat.columns)}")
+        except FileNotFoundError as e:
+            print(f"  [skip-phase-e] {e}")
 
     out_path = out_root / f"{args.instrument}_{args.year}.parquet"
     feat.write_parquet(out_path, compression="zstd", compression_level=3)
