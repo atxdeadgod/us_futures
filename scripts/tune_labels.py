@@ -1,18 +1,20 @@
 """Tune triple-barrier label parameters per instrument on the IS window (2020-2023).
 
-Reads pre-built 15-min bars, runs a grid search over (k_up, k_dn, T, atr_window),
-and writes a per-instrument CSV of (combo, class-balance, per-class mean return,
-label-return correlation, balance_score).
+V1 architecture (locked from session_diag A/B/C analysis):
+    atr_mode='time_conditional', partition_minutes=15, halt_aware=True,
+    halt_mode='truncate', min_effective_T=5.
+
+Grid axes:
+    k_up, k_dn, T, lookback_days (carried in `atr_window` field for schema
+    compatibility — represents lookback_days when atr_mode='time_conditional').
 
 The 2024+ window is out-of-sample and MUST NOT be passed here.
 
 Usage:
     python scripts/tune_labels.py --instrument ES \
-        --bars-glob '/N/project/.../bars/ES/15m/ES_*_15m.parquet' \
+        --bars-glob '/N/.../bars_ohlcv/ES/15m/ES_*_15m.parquet' \
         --start 2020-01-01 --end 2023-12-31 \
-        --out /N/project/.../label_tuning/ES_tune.csv
-
-Lock the selected combo into configs/label_params.yaml afterwards.
+        --out /N/.../label_tuning/results/ES_tune_2020_2023.csv
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ from src.labels.triple_barrier import DEFAULT_COST_PTS, tune_triple_barrier
 DEFAULT_K_UP_GRID = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5)
 DEFAULT_K_DN_GRID = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5)
 DEFAULT_T_GRID = (4, 6, 8, 12, 16, 24)  # 15-min bars: 1h .. 6h horizon
-DEFAULT_ATR_WINDOW_GRID = (20, 40, 60)
+DEFAULT_LOOKBACK_DAYS_GRID = (30, 45, 60, 90)  # TC-ATR lookback (3-way A/B/C confirmed 60+ wins)
 
 
 def _load_bars(bars_glob: str, start: date, end: date) -> pl.DataFrame:
@@ -84,11 +86,21 @@ def main() -> int:
     p.add_argument("--k-dn-grid", default=None)
     p.add_argument("--T-grid", default=None,
                    help="Comma-separated ints; overrides default 4,6,8,12,16,24")
-    p.add_argument("--atr-window-grid", default=None,
-                   help="Comma-separated ints; overrides default 20,40,60")
+    p.add_argument("--lookback-days-grid", default=None,
+                   help="Comma-separated ints for TC-ATR lookback_days; "
+                        "overrides default 30,45,60,90")
     p.add_argument("--cost-pts", type=float, default=None,
                    help="Round-trip cost in price pts (spread+commission+slippage). "
                         "Defaults to DEFAULT_COST_PTS[instrument] (ES:0.50 NQ:1.50 RTY:0.30 YM:3.00).")
+    p.add_argument("--atr-mode", default="time_conditional",
+                   choices=["calendar", "time_conditional"],
+                   help="V1 default: time_conditional (locked from A/B/C analysis)")
+    p.add_argument("--partition-minutes", type=int, default=15,
+                   help="TC-ATR partition granularity (V1 locked: 15)")
+    p.add_argument("--halt-mode", default="truncate", choices=["drop", "truncate"],
+                   help="V1 default: truncate")
+    p.add_argument("--min-effective-T", type=int, default=5,
+                   help="V1 default: 5 (drops hour-16 ET bars whose effective T<5)")
     args = p.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -102,12 +114,15 @@ def main() -> int:
     k_up_grid = _parse_float_list(args.k_up_grid) if args.k_up_grid else DEFAULT_K_UP_GRID
     k_dn_grid = _parse_float_list(args.k_dn_grid) if args.k_dn_grid else DEFAULT_K_DN_GRID
     T_grid = _parse_int_list(args.T_grid) if args.T_grid else DEFAULT_T_GRID
-    atr_window_grid = (
-        _parse_int_list(args.atr_window_grid) if args.atr_window_grid else DEFAULT_ATR_WINDOW_GRID
+    lookback_grid = (
+        _parse_int_list(args.lookback_days_grid) if args.lookback_days_grid
+        else DEFAULT_LOOKBACK_DAYS_GRID
     )
-    n_combos = len(k_up_grid) * len(k_dn_grid) * len(T_grid) * len(atr_window_grid)
+    n_combos = len(k_up_grid) * len(k_dn_grid) * len(T_grid) * len(lookback_grid)
     cost_pts = args.cost_pts if args.cost_pts is not None else DEFAULT_COST_PTS[args.instrument]
-    print(f"[tune] {args.instrument}: grid size {n_combos} combos, cost_pts={cost_pts}")
+    print(f"[tune] {args.instrument}: {n_combos} combos | atr_mode={args.atr_mode} | "
+          f"partition_min={args.partition_minutes} | halt_mode={args.halt_mode} | "
+          f"min_eff_T={args.min_effective_T} | cost_pts={cost_pts}")
 
     bars = _load_bars(args.bars_glob, start, end)
 
@@ -116,10 +131,22 @@ def main() -> int:
         k_up_grid=k_up_grid,
         k_dn_grid=k_dn_grid,
         T_grid=T_grid,
-        atr_window_grid=atr_window_grid,
+        atr_window_grid=lookback_grid,  # in TC mode, this carries lookback_days values
+        atr_mode=args.atr_mode,
+        halt_aware=True,
+        halt_mode=args.halt_mode,
+        min_effective_T=args.min_effective_T,
+        partition_minutes=args.partition_minutes,
+        bar_minutes=15,
         cost_pts=cost_pts,
     )
-    results = results.with_columns(pl.lit(args.instrument).alias("instrument"))
+    results = results.with_columns([
+        pl.lit(args.instrument).alias("instrument"),
+        pl.lit(args.atr_mode).alias("atr_mode"),
+        pl.lit(args.partition_minutes).alias("partition_minutes"),
+        pl.lit(args.halt_mode).alias("halt_mode"),
+        pl.lit(args.min_effective_T).alias("min_effective_T"),
+    ])
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,8 +164,9 @@ def main() -> int:
         .head(10)
     )
     print("\n[tune] top 10 by balance_score × |label_forward_return_corr|:")
+    # In TC mode, atr_window column carries lookback_days values
     print(ranked.select([
-        "instrument", "k_up", "k_dn", "T", "atr_window",
+        "instrument", "k_up", "k_dn", "T", pl.col("atr_window").alias("lookback_days"),
         "frac_pos", "frac_neg", "frac_zero",
         "balance_score", "label_forward_return_corr",
         "mean_ret_pts_pos", "mean_ret_pts_neg",

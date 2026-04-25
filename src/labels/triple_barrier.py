@@ -388,6 +388,12 @@ def tune_triple_barrier(
     k_dn_grid: list[float] | tuple[float, ...] = (1.0, 1.5, 2.0),
     T_grid: list[int] | tuple[int, ...] = (4, 8, 12),
     atr_window_grid: list[int] | tuple[int, ...] = (20,),
+    atr_mode: str = "calendar",
+    halt_aware: bool = True,
+    halt_mode: str = "drop",
+    min_effective_T: int = 2,
+    partition_minutes: int | None = None,
+    bar_minutes: int = 15,
     open_col: str = "open",
     high_col: str = "high",
     low_col: str = "low",
@@ -398,6 +404,14 @@ def tune_triple_barrier(
 
     Returns a DataFrame with one row per (k_up, k_dn, T, atr_window) combo,
     reporting label-balance, per-class mean realized return, and balance score.
+
+    Args:
+        atr_mode: "calendar" (default) or "time_conditional". In TC mode,
+            atr_window_grid represents lookback_days values (kept on the same
+            axis to preserve schema compatibility).
+        halt_aware, halt_mode, min_effective_T, partition_minutes: fixed
+            policy params (not grid axes) plumbed through to triple_barrier_labels.
+        bar_minutes: bar duration in minutes (15 for 15-min bars).
 
     Caller inspects the result DataFrame and picks the combo that trades off
     class balance × per-class mean-return separation × sample size.
@@ -413,6 +427,13 @@ def tune_triple_barrier(
                         k_dn=k_dn,
                         T=T,
                         atr_window=atr_w,
+                        atr_mode=atr_mode,
+                        lookback_days=atr_w,
+                        halt_aware=halt_aware,
+                        halt_mode=halt_mode,
+                        min_effective_T=min_effective_T,
+                        partition_minutes=partition_minutes,
+                        bar_minutes=bar_minutes,
                         open_col=open_col,
                         high_col=high_col,
                         low_col=low_col,
