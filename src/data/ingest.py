@@ -51,6 +51,9 @@ def _day_folder(day: date) -> str:
     return day.strftime("%Y%m%d")
 
 
+_VALID_DATASETS = ("taq", "depth", "vix")
+
+
 def locate(
     dataset: str,
     root: str,
@@ -58,16 +61,21 @@ def locate(
     day: date,
     algoseek_root: Path | str | None = None,
 ) -> ContractFile:
-    """Return the ContractFile descriptor under the new HPC layout:
+    """Return the ContractFile descriptor under the HPC layout.
 
+    For dataset in {"taq","depth"}:
         <root>/<dataset>/<root>/<YYYY>/<YYYYMMDD>/<EXPIRY>.csv.gz
 
-    `dataset` must be in {"taq","depth"}.
+    For dataset == "vix" (single-root, no per-root subdir):
+        <root>/vix/<YYYY>/<YYYYMMDD>/<EXPIRY>.csv.gz
     """
-    if dataset not in ("taq", "depth"):
-        raise ValueError(f"dataset must be 'taq' or 'depth', got {dataset!r}")
+    if dataset not in _VALID_DATASETS:
+        raise ValueError(f"dataset must be one of {_VALID_DATASETS}, got {dataset!r}")
     root_dir = Path(algoseek_root) if algoseek_root else DEFAULT_ALGOSEEK_ROOT
-    path = root_dir / dataset / root / f"{day.year}" / _day_folder(day) / f"{expiry}.csv.gz"
+    if dataset == "vix":
+        path = root_dir / "vix" / f"{day.year}" / _day_folder(day) / f"{expiry}.csv.gz"
+    else:
+        path = root_dir / dataset / root / f"{day.year}" / _day_folder(day) / f"{expiry}.csv.gz"
     return ContractFile(dataset=dataset, root=root, expiry=expiry, day=day, path=path)
 
 
@@ -78,22 +86,42 @@ def day_dir(
     algoseek_root: Path | str | None = None,
 ) -> Path:
     """Directory holding all expiry files for (dataset, root, day)."""
-    if dataset not in ("taq", "depth"):
-        raise ValueError(f"dataset must be 'taq' or 'depth', got {dataset!r}")
+    if dataset not in _VALID_DATASETS:
+        raise ValueError(f"dataset must be one of {_VALID_DATASETS}, got {dataset!r}")
     root_dir = Path(algoseek_root) if algoseek_root else DEFAULT_ALGOSEEK_ROOT
+    if dataset == "vix":
+        return root_dir / "vix" / f"{day.year}" / _day_folder(day)
     return root_dir / dataset / root / f"{day.year}" / _day_folder(day)
 
 
 def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCTime") -> pl.DataFrame:
-    """Build a UTC nanosecond timestamp column `ts` from Algoseek YYYYMMDD + nanoseconds-of-day.
+    """Build a UTC nanosecond timestamp column `ts` from Algoseek YYYYMMDD + intraday time.
 
-    TAQ UTCTime is 15 chars HHMMSSnnnnnnnnn. We right-pad to 15 and slice positionally.
+    Algoseek encodes the time-of-day as `HHMMSS<sub_seconds>` where the
+    sub-second precision varies by dataset:
+        - Futures TAQ (`taq`/`depth`): 9-digit nanoseconds → 15-char total
+        - VIX TAQ (`vix`):              3-digit milliseconds → 9-char total
+    Some datasets also use 6-digit microseconds (12-char total).
+
+    We auto-detect by looking at the max string length of the column on the
+    incoming frame and parse accordingly.
     """
+    max_len = df.select(pl.col(time_col).cast(pl.Utf8).str.len_chars().max()).item()
+    if max_len is None:
+        raise ValueError("Empty UTCTime column — cannot infer time precision")
+
+    if max_len <= 9:
+        zfill_to, sub_start, sub_len, sub_unit = 9, 6, 3, "milliseconds"
+    elif max_len <= 12:
+        zfill_to, sub_start, sub_len, sub_unit = 12, 6, 6, "microseconds"
+    else:
+        zfill_to, sub_start, sub_len, sub_unit = 15, 6, 9, "nanoseconds"
+
     return (
         df.with_columns(
             [
                 pl.col(date_col).cast(pl.Utf8).str.strptime(pl.Date, "%Y%m%d").alias("_date"),
-                pl.col(time_col).cast(pl.Utf8).str.zfill(15).alias("_tstr"),
+                pl.col(time_col).cast(pl.Utf8).str.zfill(zfill_to).alias("_tstr"),
             ]
         )
         .with_columns(
@@ -102,7 +130,7 @@ def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCT
                 hours=pl.col("_tstr").str.slice(0, 2).cast(pl.Int64),
                 minutes=pl.col("_tstr").str.slice(2, 2).cast(pl.Int64),
                 seconds=pl.col("_tstr").str.slice(4, 2).cast(pl.Int64),
-                nanoseconds=pl.col("_tstr").str.slice(6, 9).cast(pl.Int64),
+                **{sub_unit: pl.col("_tstr").str.slice(sub_start, sub_len).cast(pl.Int64)},
             )
         )
         .drop(["_date", "_tstr"])
@@ -110,9 +138,13 @@ def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCT
 
 
 def read_taq(cf: ContractFile) -> pl.DataFrame:
-    """Read a single Algoseek TAQ file. Returns polars DataFrame with parsed `ts`."""
-    if cf.dataset != "taq":
-        raise ValueError("read_taq expects a taq ContractFile")
+    """Read a single Algoseek TAQ file. Returns polars DataFrame with parsed `ts`.
+
+    Accepts dataset='taq' or dataset='vix' — both share the TAQ v2 column schema
+    (VIX futures files are TAQ-formatted under a separate root).
+    """
+    if cf.dataset not in ("taq", "vix"):
+        raise ValueError(f"read_taq expects a taq/vix ContractFile, got {cf.dataset!r}")
     if not cf.exists:
         raise FileNotFoundError(cf.path)
     df = pl.read_csv(

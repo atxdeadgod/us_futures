@@ -46,9 +46,10 @@ def _mk_phase_a_bars(n_days: int = 5, seed: int = 0) -> pl.DataFrame:
             rows.append(dict(
                 ts=ts, open=px, high=high, low=low, close=px, volume=volume,
                 dollar_volume=px * volume,
-                buys_qty=buys, sells_qty=sells, trades_count=volume // 5,
+                buys_qty=buys, sells_qty=sells, trades_count=max(1, volume // 5),
                 bid_close=mid - spread / 2, ask_close=mid + spread / 2,
                 mid_close=mid, spread_abs_close=spread,
+                spread_mean_sub=spread, spread_std_sub=max(1e-6, abs(rng.normal(0, 0.02))),
                 cvd_globex=cvd,
             ))
     return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
@@ -104,7 +105,7 @@ def test_step1_spread_to_mid_bps_positive():
 def test_step1_realized_vol_warmup():
     """Realized vol with window=20 should be null for first 20 bars (after log_return)."""
     bars = _mk_phase_a_bars(n_days=3)
-    out = panel.attach_base_microstructure_features(bars, rv_window=20)
+    out = panel.attach_base_microstructure_features(bars, rv_windows=(20,))
     rv = out["realized_vol_w20"].to_list()
     # First ~20 should be null
     assert rv[0] is None
@@ -343,12 +344,20 @@ def test_step5b_l2_deep_features_emit_expected_columns():
     expected = [
         "cum_imbalance_d10", "dw_imbalance_d10",
         "depth_weighted_spread_d10", "liquidity_adjusted_spread_d10",
-        "spread_acceleration", "hhi_d10",
+        "spread_acceleration", "hhi_bid_d10", "hhi_ask_d10",
         "deep_ofi_d10_decay0", "deep_ofi_d10_decay03",
         "spread_zscore_w20",
     ]
     for c in expected:
         assert c in out.columns, f"missing L2-deep column: {c}"
+    # Per-level features for top 10 (volume_imbalance, basic_spread, ofi_at) and
+    # top 5 (order_count_imbalance, order_size_imbalance)
+    for k in range(1, 11):
+        for prefix in ("volume_imbalance", "basic_spread", "ofi_at"):
+            assert f"{prefix}_L{k}" in out.columns
+    for k in range(1, 6):
+        for prefix in ("order_count_imbalance", "order_size_imbalance"):
+            assert f"{prefix}_L{k}" in out.columns
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +429,112 @@ def test_per_instrument_pipeline_attach_overnight_off():
     assert "is_rth" in out.columns
     # Overnight columns NOT added
     assert "overnight_log_return" not in out.columns
+
+
+def test_attach_pattern_features_emits_expected_columns():
+    bars = _mk_phase_a_bars(n_days=10)
+    base = panel.attach_base_microstructure_features(bars)
+    out = panel.attach_pattern_features(base)
+    expected = [
+        "atr_proxy",
+        "breakout_magnitude_up_w30", "breakout_magnitude_down_w30",
+        "breakout_reversal_up_w30", "breakout_reversal_down_w30",
+        "spike_and_fade_volume_w20",
+        "imbalance_persistence_runlength_w30",
+        "cvd_price_divergence_up_w30", "cvd_price_divergence_down_w30",
+        "range_compression_ratio_w20",
+        "absorption_score_w20",
+        "post_breakout_flow_reversal_up", "post_breakout_flow_reversal_down",
+    ]
+    for c in expected:
+        assert c in out.columns, f"missing pattern column: {c}"
+
+
+def test_attach_engine_features_emits_fracdiff_and_pin():
+    bars = _mk_phase_a_bars(n_days=5)
+    out = panel.attach_engine_features(
+        bars, fracdiff_d=0.4, round_pin_N_grid=(10.0, 25.0, 50.0),
+    )
+    assert "fracdiff_logclose_d0.4" in out.columns
+    for N in (10, 25, 50):
+        assert f"round_pin_distance_N{N}" in out.columns
+    # Pin distance is in [0, N/2]
+    for N in (10, 25, 50):
+        col = out[f"round_pin_distance_N{N}"].drop_nulls().to_list()
+        assert all(0 <= v <= N / 2 + 1e-9 for v in col)
+
+
+def test_attach_ema_smoothed_creates_per_value_per_span():
+    from src.features import smoothed
+    bars = _mk_phase_a_bars(n_days=10)
+    base = panel.attach_base_microstructure_features(bars)
+    out = smoothed.attach_ema_smoothed(base, value_cols=("ofi", "abs_log_return"), spans=(10, 30))
+    for v in ("ofi", "abs_log_return"):
+        for s in (10, 30):
+            assert f"{v}_ema_s{s}" in out.columns
+
+
+def test_attach_ema_smoothed_skips_missing_silently():
+    from src.features import smoothed
+    bars = _mk_phase_a_bars(n_days=3)
+    out = smoothed.attach_ema_smoothed(bars, value_cols=("does_not_exist",), spans=(10,))
+    assert "does_not_exist_ema_s10" not in out.columns
+
+
+def test_attach_vx_features_three_slot():
+    """Wide-attach VX1/VX2/VX3 mid+spread to ES bars and compute curvature."""
+    es_bars = _mk_phase_a_bars(n_days=2, seed=1).select(["ts", "close"])
+
+    def _mk_vx(seed: int, base_mid: float):
+        rng = np.random.default_rng(seed)
+        rows = []
+        base = datetime(2024, 3, 4, 0, 0, tzinfo=timezone.utc)
+        for d in range(2):
+            for b in range(96):
+                ts = base + timedelta(days=d, minutes=15 * b)
+                mid = base_mid + rng.normal(0, 0.05)
+                rows.append(dict(
+                    ts=ts, bid_close=mid - 0.025, ask_close=mid + 0.025,
+                    mid_close=mid, spread_abs_close=0.05,
+                ))
+        return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+    vx1 = _mk_vx(11, 14.0)
+    vx2 = _mk_vx(12, 14.5)
+    vx3 = _mk_vx(13, 15.0)
+    out = panel.attach_vx_features(
+        es_bars, vx1_bars=vx1, vx2_bars=vx2, vx3_bars=vx3, zscore_window=10, spread_z_window=20,
+    )
+    for c in ("vx1_mid", "vx2_mid", "vx3_mid",
+              "vx_calendar_spread", "vx_calendar_ratio",
+              "vx_term_curvature", "vx1_zscore_w10", "vx_spread_zscore_w20"):
+        assert c in out.columns, f"missing VX column: {c}"
+    # Values are sensible
+    assert out["vx_calendar_ratio"].drop_nulls().mean() < 1.0  # contango
+    # Term curvature ≈ vx3 - 2*vx2 + vx1 = 15 − 29 + 14 = 0 in expectation
+    curv = out["vx_term_curvature"].drop_nulls().mean()
+    assert abs(curv) < 0.5
+
+
+def test_per_instrument_pipeline_full_set_works():
+    """build_per_instrument_features with patterns + engines + smoothed + cyclic on."""
+    bars = _mk_phase_a_bars(n_days=40)
+    out = panel.build_per_instrument_features(
+        bars,
+        lookback_days_grid=(20,),
+        attach_patterns=True, attach_engines=True,
+        attach_smoothed=True, attach_cyclic_minute=True,
+    )
+    # Cyclic
+    assert "minute_of_day_sin" in out.columns
+    assert "minute_of_day_cos" in out.columns
+    # Pattern at least one
+    assert "atr_proxy" in out.columns
+    # Engine at least one
+    assert any(c.startswith("fracdiff_logclose_d") for c in out.columns)
+    assert "round_pin_distance_N25" in out.columns
+    # Smoothed at least one
+    assert any(c.endswith("_ema_s10") for c in out.columns)
 
 
 def test_step6_drop_invalid_filter():
