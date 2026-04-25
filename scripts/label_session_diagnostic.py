@@ -3,16 +3,17 @@
 Loads 15-min OHLCV bars for an instrument, runs the labeler with the locked
 V1 params, and slices class distribution + return correlation by ET hour.
 
-Goal: decide whether the static T parameter (2h horizon) is broken across
-the 23h CME session — i.e., whether frac_zero / corr / mean_ret vary
-dramatically by time of day. If yes, justify dynamic T or session
-restriction. If no, static T is fine.
+Supports both calendar ATR (legacy) and time-conditional ATR (TC-ATR) via
+--atr-mode. The headline value of this script is comparing the per-hour
+class distribution under both modes — TC-ATR should flatten frac_zero
+across the 23h CME session.
 
-Usage (locally or on HPC):
+Usage:
     python scripts/label_session_diagnostic.py \
         --instrument ES \
         --bars-glob '/N/.../label_tuning/bars_ohlcv/ES/15m/*.parquet' \
-        --out       /N/.../label_tuning/results/ES_session_diag.csv
+        --out       /N/.../label_tuning/results/ES_session_diag.csv \
+        --atr-mode  time_conditional --lookback-days 30
 """
 from __future__ import annotations
 
@@ -127,6 +128,13 @@ def main() -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--start", default="2020-01-01")
     p.add_argument("--end", default="2023-12-31")
+    p.add_argument("--atr-mode", default="calendar",
+                   choices=["calendar", "time_conditional"],
+                   help="ATR computation mode for the labeler")
+    p.add_argument("--lookback-days", type=int, default=30,
+                   help="Lookback days for time_conditional ATR")
+    p.add_argument("--halt-aware", action="store_true", default=True,
+                   help="Drop bars whose forward T-window crosses a halt (>30min ts gap)")
     args = p.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -135,7 +143,9 @@ def main() -> int:
         raise SystemExit(f"--end {end} hits OOS window; must be <= 2023-12-31")
 
     params = V1_PARAMS[args.instrument]
-    print(f"[diag] {args.instrument}  params={params}  IS=[{start} .. {end}]")
+    print(f"[diag] {args.instrument}  params={params}  IS=[{start} .. {end}]  "
+          f"atr_mode={args.atr_mode}  lookback_days={args.lookback_days}  "
+          f"halt_aware={args.halt_aware}")
 
     bars = _load_bars(args.bars_glob)
     bars = bars.filter(
@@ -143,7 +153,12 @@ def main() -> int:
     ).sort("ts")
     print(f"[diag] {bars.height:,} bars after IS filter")
 
-    labeled = triple_barrier_labels(bars, **params)
+    labeled = triple_barrier_labels(
+        bars, **params,
+        atr_mode=args.atr_mode,
+        lookback_days=args.lookback_days,
+        halt_aware=args.halt_aware,
+    )
     diag = per_hour_stats(labeled)
 
     # Session-level aggregate (weighted by n)

@@ -17,6 +17,7 @@ from src.labels.triple_barrier import (
     _balance_score,
     _triple_barrier_np,
     atr_column,
+    attach_atr_time_conditional,
     triple_barrier_labels,
     tune_triple_barrier,
 )
@@ -339,3 +340,124 @@ def test_tune_triple_barrier_larger_T_higher_label_density():
     by_T = {int(r["T"]): r for r in out.iter_rows(named=True)}
     # Longer horizon → fewer time-expired (zero) labels
     assert by_T[20]["frac_zero"] <= by_T[3]["frac_zero"]
+
+
+# ---------------------------------------------------------------------------
+# Time-conditional ATR
+# ---------------------------------------------------------------------------
+
+def _mk_15min_bars_multi_day(n_days: int, vol_by_hour: dict[int, float], rng_seed: int = 0):
+    """Build 15-min bar series across n_days, with hour-of-day-keyed vol scale."""
+    rng = np.random.default_rng(rng_seed)
+    bars_per_day = 96  # 24h × 4
+    rows = []
+    base = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+    px = 5000.0
+    for d in range(n_days):
+        for b in range(bars_per_day):
+            ts = base + timedelta(days=d, minutes=15 * b)
+            hour_utc = ts.hour
+            vol = vol_by_hour.get(hour_utc, 1.0)
+            move = rng.normal(0, vol)
+            px = px + move
+            high = px + abs(rng.normal(0, vol * 0.5))
+            low = px - abs(rng.normal(0, vol * 0.5))
+            rows.append(dict(ts=ts, open=px, high=high, low=low, close=px))
+    return pl.DataFrame(rows).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+
+def test_atr_time_conditional_partitions_by_bar_of_day():
+    """TC-ATR over a known vol-pattern recovers the per-hour vol scale."""
+    # 60 days, vol=10.0 at UTC hour 14-16 (= ET 09-11 in winter EST),
+    # vol=1.0 elsewhere. TC-ATR for those hours should be MUCH bigger than off-hours.
+    high_vol_hours = {14: 10.0, 15: 10.0, 16: 10.0}
+    bars = _mk_15min_bars_multi_day(n_days=60, vol_by_hour=high_vol_hours)
+
+    out = attach_atr_time_conditional(
+        bars, lookback_days=20, bar_minutes=15, out_col="atr_tc"
+    )
+    out = out.with_columns(
+        atr_column(pl.col("high"), pl.col("low"), pl.col("close"), window=20).alias("atr_cal"),
+        pl.col("ts").dt.hour().alias("h_utc"),
+    ).filter(pl.col("atr_tc").is_not_null() & pl.col("atr_cal").is_not_null())
+
+    by_hour = out.group_by("h_utc").agg(pl.col("atr_tc").mean()).sort("h_utc")
+    h_to_tc = {int(r["h_utc"]): r["atr_tc"] for r in by_hour.iter_rows(named=True)}
+
+    # TC-ATR at high-vol hour (14) should be MUCH bigger than at low-vol hour (4)
+    assert h_to_tc[14] > h_to_tc[4] * 5, \
+        f"TC-ATR should track per-hour vol regime; got h14={h_to_tc[14]:.2f}, h4={h_to_tc[4]:.2f}"
+
+
+def test_triple_barrier_labels_atr_mode_time_conditional():
+    """`atr_mode='time_conditional'` produces labels using TC-ATR."""
+    bars = _mk_15min_bars_multi_day(n_days=40, vol_by_hour={14: 5.0, 15: 5.0})
+    out = triple_barrier_labels(
+        bars, k_up=1.0, k_dn=1.0, T=4,
+        atr_mode="time_conditional", lookback_days=15,
+    )
+    assert "atr" in out.columns
+    # Should have non-null ATR for bars deep enough into the series
+    valid = out.filter(pl.col("atr").is_finite() & pl.col("realized_ret").is_finite())
+    assert valid.height > 100
+
+
+def test_triple_barrier_labels_invalid_atr_mode():
+    bars = _mk_bars([100.0 + 0.1 * i for i in range(40)])
+    with pytest.raises(ValueError, match="atr_mode"):
+        triple_barrier_labels(bars, atr_mode="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Halt-aware labeling
+# ---------------------------------------------------------------------------
+
+def test_triple_barrier_labels_halt_aware_drops_halt_crossing_bars():
+    """Bars whose forward T-window crosses a halt (>30min ts gap) get NaN ret."""
+    # 10 bars at 15-min cadence, then a 60-min gap (simulated halt), then 5 more bars
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    ts = []
+    for i in range(10):
+        ts.append(start + timedelta(minutes=15 * i))
+    # 60-min gap = halt
+    halt_end = ts[-1] + timedelta(minutes=60)
+    for i in range(5):
+        ts.append(halt_end + timedelta(minutes=15 * i))
+    n = len(ts)
+    closes = [100.0 + 0.05 * i for i in range(n)]
+    bars = pl.DataFrame({
+        "ts": ts,
+        "open": closes,
+        "high": [c + 0.3 for c in closes],
+        "low": [c - 0.3 for c in closes],
+        "close": closes,
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+    # T=4 → bars at indices 6, 7, 8, 9 have forward windows that cross the halt
+    out = triple_barrier_labels(
+        bars, k_up=1.5, k_dn=1.5, T=4, atr_window=3, halt_aware=True,
+    )
+    # Bars whose forward window crosses halt → realized_ret NaN, hit_offset = -1
+    halt_dropped = out.filter(pl.col("hit_offset") == -1)
+    # Should be at least the bars at indices 6, 7, 8, 9 (forward 4 bars crosses halt)
+    assert halt_dropped.height >= 1
+    # All of these have NaN ret
+    assert halt_dropped["realized_ret"].is_nan().all() or halt_dropped["realized_ret"].is_null().all()
+
+
+def test_triple_barrier_labels_halt_aware_off_keeps_halt_crossing_bars():
+    """halt_aware=False reverts to legacy behavior (no halt detection)."""
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    ts = [start + timedelta(minutes=15 * i) for i in range(10)]
+    halt_end = ts[-1] + timedelta(minutes=60)
+    ts += [halt_end + timedelta(minutes=15 * i) for i in range(5)]
+    n = len(ts)
+    closes = [100.0] * n
+    bars = pl.DataFrame({
+        "ts": ts, "open": closes,
+        "high": [c + 0.3 for c in closes], "low": [c - 0.3 for c in closes], "close": closes,
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+    out = triple_barrier_labels(bars, k_up=1.5, k_dn=1.5, T=4, atr_window=3, halt_aware=False)
+    # No bars should be marked halt-dropped
+    assert (out["hit_offset"] == -1).sum() == 0

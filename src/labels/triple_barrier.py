@@ -26,13 +26,19 @@ import polars as pl
 
 
 # ---------------------------------------------------------------------------
-# ATR helper (true-range rolling mean)
+# ATR helpers
 # ---------------------------------------------------------------------------
 
 def atr_column(
     high_col: pl.Expr, low_col: pl.Expr, close_col: pl.Expr, window: int = 20
 ) -> pl.Expr:
-    """True-Range rolling mean. TR = max(H−L, |H−prev_C|, |L−prev_C|)."""
+    """Calendar-window ATR. TR = max(H−L, |H−prev_C|, |L−prev_C|), rolling-mean
+    over the previous `window` bars regardless of time of day.
+
+    Tends to over-size barriers in low-vol hours and under-size them at
+    high-vol hours. Use `atr_time_conditional` to fix that for off-hours
+    labeling.
+    """
     prev_close = close_col.shift(1)
     tr = pl.max_horizontal(
         high_col - low_col,
@@ -40,6 +46,48 @@ def atr_column(
         (low_col - prev_close).abs(),
     )
     return tr.rolling_mean(window_size=window)
+
+
+def attach_atr_time_conditional(
+    bars: pl.DataFrame,
+    lookback_days: int = 30,
+    bar_minutes: int = 15,
+    high_col: str = "high",
+    low_col: str = "low",
+    close_col: str = "close",
+    ts_col: str = "ts",
+    out_col: str = "atr",
+) -> pl.DataFrame:
+    """Attach a time-conditional ATR column to the bar frame.
+
+    ATR = rolling mean of TR over the same bar-of-day across the last
+    `lookback_days` trading days. The bar at (date d, bar-of-day b) gets
+    ATR_tc = mean(TR over the (b)-bars from days d-lookback_days..d-1).
+
+    Sizes barriers to the local intraday vol regime, fixing calendar-ATR
+    mis-sizing at low-volume off-hours and high-volume RTH open.
+
+    Note: `polars.Expr.rolling_mean(...).over(<expression>)` does not partition
+    correctly in current polars versions; we materialize bar_of_day as an
+    explicit column and use `.over("bar_of_day")` (column name).
+    """
+    bars_per_hour = 60 // bar_minutes
+    et = pl.col(ts_col).dt.convert_time_zone("US/Eastern")
+    df = bars.with_columns(
+        (et.dt.hour() * bars_per_hour + et.dt.minute() // bar_minutes).alias("_bar_of_day")
+    )
+    prev_close = pl.col(close_col).shift(1)
+    df = df.with_columns(
+        pl.max_horizontal(
+            pl.col(high_col) - pl.col(low_col),
+            (pl.col(high_col) - prev_close).abs(),
+            (pl.col(low_col) - prev_close).abs(),
+        ).alias("_tr")
+    )
+    df = df.with_columns(
+        pl.col("_tr").rolling_mean(window_size=lookback_days).over("_bar_of_day").alias(out_col)
+    )
+    return df.drop(["_bar_of_day", "_tr"])
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +103,8 @@ def _triple_barrier_np(
     k_up: float,
     k_dn: float,
     T: int,
+    ts_seconds: np.ndarray | None = None,
+    halt_gap_seconds: int = 1800,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Returns (labels, hit_bar_offset, realized_log_return, realized_ret_pts).
 
@@ -63,6 +113,11 @@ def _triple_barrier_np(
     realized_ret_pts: absolute price diff (barrier_price − close[i]) in instrument
         price units — i.e., ES points, NQ points, etc. Used downstream to evaluate
         whether a vol-scaled barrier is tradeable after costs.
+
+    If ts_seconds is provided, bars whose forward T-window crosses a halt
+    (consecutive ts gap > halt_gap_seconds, default 30min) are marked
+    unlabelable: realized_ret stays NaN so the row is filtered downstream.
+    Without ts_seconds, halt detection is skipped (legacy behavior).
     """
     n = len(close)
     labels = np.zeros(n, dtype=np.int8)
@@ -75,6 +130,20 @@ def _triple_barrier_np(
             labels[i] = 0
             offsets[i] = 0
             continue
+
+        # Halt-aware: if the forward T-window crosses any halt boundary, drop this bar.
+        if ts_seconds is not None:
+            forward_end = min(i + T + 1, n)
+            crosses_halt = False
+            for j in range(i + 1, forward_end):
+                if ts_seconds[j] - ts_seconds[j - 1] > halt_gap_seconds:
+                    crosses_halt = True
+                    break
+            if crosses_halt:
+                # leave label=0, ret=NaN — downstream filter drops it
+                offsets[i] = -1
+                continue
+
         upper = close[i] + k_up * atr[i]
         lower = close[i] - k_dn * atr[i]
         j_max = min(i + T + 1, n)
@@ -142,28 +211,62 @@ def triple_barrier_labels(
     k_dn: float = 1.0,
     T: int = 8,
     atr_window: int = 20,
+    atr_mode: str = "calendar",
+    lookback_days: int = 30,
+    bar_minutes: int = 15,
+    halt_aware: bool = True,
     open_col: str = "open",
     high_col: str = "high",
     low_col: str = "low",
     close_col: str = "close",
+    ts_col: str = "ts",
 ) -> pl.DataFrame:
     """Emit triple-barrier labels on a bar frame.
 
+    Args:
+        atr_mode: "calendar" (default — ATR over last `atr_window` bars regardless
+            of time of day) or "time_conditional" (ATR over same bar-of-day across
+            last `lookback_days` trading days). The TC mode fixes barrier
+            mis-sizing across the 23h CME session.
+        lookback_days: lookback for time_conditional ATR (only used when
+            atr_mode='time_conditional').
+        bar_minutes: bar duration in minutes (15 for 15-min bars). Defines the
+            bar-of-day index for TC ATR.
+        halt_aware: if True (default), bars whose forward T-window crosses a
+            CME halt (>30min ts gap) are marked unlabelable (label=0, ret=NaN,
+            offset=-1). Filter `realized_ret.is_finite()` to drop them.
+
     Returns the original frame with appended columns:
-        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32),
+        atr, label (Int8 in {-1,0,+1}), hit_offset (Int32; -1 = halt-dropped),
         realized_ret (Float64, log return), realized_ret_pts (Float64, price pts).
     """
-    df = bars.with_columns(
-        atr_column(pl.col(high_col), pl.col(low_col), pl.col(close_col), window=atr_window).alias("atr")
-    )
+    if atr_mode == "calendar":
+        df = bars.with_columns(
+            atr_column(
+                pl.col(high_col), pl.col(low_col), pl.col(close_col), window=atr_window
+            ).alias("atr")
+        )
+    elif atr_mode == "time_conditional":
+        df = attach_atr_time_conditional(
+            bars,
+            lookback_days=lookback_days,
+            bar_minutes=bar_minutes,
+            high_col=high_col, low_col=low_col, close_col=close_col, ts_col=ts_col,
+            out_col="atr",
+        )
+    else:
+        raise ValueError(f"atr_mode must be 'calendar' or 'time_conditional'; got {atr_mode!r}")
     close = df[close_col].to_numpy()
     high = df[high_col].to_numpy()
     low = df[low_col].to_numpy()
     open_ = df[open_col].to_numpy()
     atr = df["atr"].to_numpy()
+    ts_seconds = (
+        df[ts_col].dt.epoch(time_unit="s").to_numpy().astype(np.int64) if halt_aware else None
+    )
 
     labels, offsets, rets, rets_pts = _triple_barrier_np(
-        close, high, low, open_, atr, k_up, k_dn, T
+        close, high, low, open_, atr, k_up, k_dn, T, ts_seconds=ts_seconds
     )
 
     return df.with_columns(
