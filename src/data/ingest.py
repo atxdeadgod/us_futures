@@ -125,13 +125,15 @@ def _parse_ts(df: pl.DataFrame, date_col: str = "UTCDate", time_col: str = "UTCT
             ]
         )
         .with_columns(
-            ts=pl.col("_date").cast(pl.Datetime("ns", "UTC"))
-            + pl.duration(
-                hours=pl.col("_tstr").str.slice(0, 2).cast(pl.Int64),
-                minutes=pl.col("_tstr").str.slice(2, 2).cast(pl.Int64),
-                seconds=pl.col("_tstr").str.slice(4, 2).cast(pl.Int64),
-                **{sub_unit: pl.col("_tstr").str.slice(sub_start, sub_len).cast(pl.Int64)},
-            )
+            ts=(
+                pl.col("_date").cast(pl.Datetime("ns", "UTC"))
+                + pl.duration(
+                    hours=pl.col("_tstr").str.slice(0, 2).cast(pl.Int64),
+                    minutes=pl.col("_tstr").str.slice(2, 2).cast(pl.Int64),
+                    seconds=pl.col("_tstr").str.slice(4, 2).cast(pl.Int64),
+                    **{sub_unit: pl.col("_tstr").str.slice(sub_start, sub_len).cast(pl.Int64)},
+                )
+            ).cast(pl.Datetime("ns", "UTC"))  # force consistent ns precision regardless of input granularity
         )
         .drop(["_date", "_tstr"])
     )

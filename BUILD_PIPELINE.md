@@ -1,9 +1,10 @@
 # Feature-Panel Build Pipeline
 
 **Purpose**: one place to look up *how to build the V1 ES feature panel from scratch*.
-**Scope**: V1 = single-contract ES, ~378 features per 15-min bar.
-**Companion docs**: `FEATURES.md` (the catalog of what each feature means) and
-`LABELING_V1_SUMMARY.md` (the triple-barrier label spec).
+**Scope**: V1 = single-contract ES, ~396 features per 15-min bar (with VX + GEX wired).
+**Companion docs**: `FEATURES.md` (the catalog of what each feature means),
+`LABELING_V1_SUMMARY.md` (the triple-barrier label spec), and
+`REFACTOR.md` (the 4-phase architecture this pipeline follows).
 
 ---
 
@@ -13,20 +14,31 @@ Assuming raw Algoseek mirror is already on bigred at
 `/N/project/ksb-finance-backtesting/data/algoseek_futures/{taq,depth,vix}/...`:
 
 ```bash
-# 1. Bars (independent, can run in parallel)
+# Phase 1: Bars (independent, can run in parallel)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_phase_a_bars.sbatch'      # 30 instruments × 15m  (~6h, array of 30)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_l2_bars.sbatch'           # ES/NQ/RTY/YM Phase A+B (~3h, array of 4)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_vx_bars.sbatch'           # VX1/VX2/VX3 15m       (~75min)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_5sec_bars.sbatch'         # ES 5-sec (for VPIN/Hawkes; ~60min)
 
-# 2. GEX (depends on SPX options chain at /N/.../spx_options_chain/)
+# Phase 2a: GEX daily profile (depends on SPX options chain at /N/.../spx_options_chain/)
 ssh bigred 'cd ~/us_futures && sbatch scripts/build_gex_features.sbatch'      # SPX+SPY × 5 yrs  (~15min, array of 10)
 
-# 3. ES feature panel (depends on Phase A+B ES, VX1-3, GEX)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_es_panel.sbatch'          # ES × 5 years (~30min, array of 5)
+# Phase 2b: per-source feature panels (independent of each other)
+ssh bigred 'cd ~/us_futures && sbatch scripts/build_futures_panel.sbatch'     # bar-derived + VX, ES × 5 yrs  (~30min, array of 5)
+ssh bigred 'cd ~/us_futures && sbatch scripts/build_options_panel.sbatch'     # GEX-derived, ES × 5 yrs       (~10min, array of 5)
+
+# Phase 3: single-contract merged panel + V1 labels
+ssh bigred 'cd ~/us_futures && sbatch scripts/build_single_panel.sbatch'      # join futures+options + label, ES × 5 yrs (~10min, array of 5)
+
+# Phase 4: cross-sectional features (only after building single panels for ALL 30 instruments)
+ssh bigred 'cd ~/us_futures && sbatch scripts/build_cross_panel.sbatch'       # 4 trading instruments × 5 yrs (~30min, array of 20)
 ```
 
-Output: `/N/project/ksb-finance-backtesting/data/features/ES_panel_{2020..2024}.parquet`
+Outputs:
+- `/N/.../features/futures/{INSTR}_{YEAR}.parquet`   (Phase 2b output, bar-derived)
+- `/N/.../features/options/{INSTR}_{YEAR}.parquet`   (Phase 2b output, GEX)
+- `/N/.../features/single/{INSTR}_{YEAR}.parquet`    (Phase 3 output, merged + labeled)
+- `/N/.../features/cross/{TARGET}_{YEAR}.parquet`    (Phase 4 output, with CS features)
 
 Local smoke (single year, single day) before any SLURM job — see "Smoke tests" below.
 
@@ -35,34 +47,41 @@ Local smoke (single year, single day) before any SLURM job — see "Smoke tests"
 ## Stage map
 
 ```
-                 raw Algoseek (taq/depth/vix)
-                          │
-        ┌─────────────────┼──────────────────────────┐
-        │                 │                          │
-        ▼                 ▼                          ▼
-  Phase A bars      Phase A+B bars             VX1/VX2/VX3 bars
-  (30 instr)        (ES/NQ/RTY/YM)             (3 slots)
-  15m parquets      15m parquets w/ L1-L10     15m parquets
-        │                 │                          │
-        │                 ▼                          │
-        │           5-sec bars (ES)                  │
-        │           (for VPIN/Hawkes — V1.5)         │
-        │                                            │
-        │                  SPX options chain         │
-        │                          │                 │
-        │                          ▼                 │
-        │                  GEX daily profile         │
-        │                          │                 │
-        └─────────────────┬────────┴─────────────────┘
-                          ▼
-               ╔════════════════════════╗
-               ║  build_es_panel.py     ║
-               ║  (single-contract ES)  ║
-               ╚════════════════════════╝
-                          │
-                          ▼
-              ES_panel_{YEAR}.parquet
-              (~378 cols, labeled, valid rows only)
+PHASE 1: BARS (raw Algoseek → per-day parquets)
+
+   raw Algoseek (taq/depth/vix)
+        │
+        ├──→ Phase A bars       (30 instruments × 15m)
+        ├──→ Phase A+B bars     (4 trading instr × 15m + L1-L10 book)
+        ├──→ VX1/VX2/VX3 bars   (front-3 monthly VX × 15m)
+        └──→ 5-sec bars         (ES, for VPIN/Hawkes — V1.5)
+
+PHASE 2: PER-SOURCE FEATURE PANELS
+                                    │
+   bars ─→ build_futures_panel.py ──┤  ┌──→ features/futures/{INSTR}_{YEAR}.parquet
+                                    │  │     (per-instrument bar features + VX)
+                                    │  │
+   SPX/NDX options chain            │  │
+        ├─→ GEX daily profile       │  │
+        └─→ build_options_panel.py ─┤──┤──→ features/options/{INSTR}_{YEAR}.parquet
+                                    │  │     (per-instrument GEX features)
+                                    │  │
+PHASE 3: SINGLE-CONTRACT MERGE      │  │
+                                    │  │
+        build_single_panel.py ←─────┼──┘
+                 │
+                 ├─→ join on ts (futures + options)
+                 ├─→ apply V1 triple-barrier labels
+                 └─→ features/single/{INSTR}_{YEAR}.parquet
+
+PHASE 4: CROSS-SECTIONAL
+                 │
+        build_cross_panel.py ──→ joins all 30 single panels on ts
+                 │             ├─→ Gauss-Rank universe + per-class
+                 │             ├─→ synthetic DXY, rates curve, risk-on/off
+                 │             └─→ rolling cross-asset correlations
+                 │
+                 └─→ features/cross/{TARGET}_{YEAR}.parquet
 ```
 
 ---
@@ -108,35 +127,45 @@ input dependencies. SLURM array tasks are independent days × instruments.
 - **Script**: `scripts/build_gex_features.py`, `build_gex_features.sbatch`.
 - **Status**: ✅ done — SPX + SPY × 2020-2024.
 
-### S6. ES feature panel (the V1 entry point)
-- **Reads**: Phase A+B ES + VX1/VX2/VX3 + GEX.
-- **Writes**: `features/ES_panel_{YEAR}.parquet`.
-- **Script**: `scripts/build_es_panel.py`, `build_es_panel.sbatch` (array=0-4, one year per task).
-- **Pipeline inside the script** (orchestrated by `src/features/panel.py`):
+### S6. Futures feature panel (Phase 2b — bar-derived per-instrument features)
+- **Reads**: Phase A+B bars (or Phase A with `--no-l2-deep`) + VX1/VX2/VX3 bars (optional).
+- **Writes**: `features/futures/{INSTR}_{YEAR}.parquet`.
+- **Script**: `scripts/build_futures_panel.py`, `build_futures_panel.sbatch` (array=0-4, one year per task; override INSTR via env).
+- **Pipeline** (orchestrated by `src/features/single_contract.build_per_instrument_features` + `attach_l2_deep_features` + `external_sources.attach_vx_features`):
 
   ```
-  load Phase A+B ES bars (year)             →  90 cols
-  ├── attach_base_microstructure_features    +44   (returns/flow/vol/moments/illiq/...)
-  ├── attach_session_flags                   +5
-  ├── attach_minute_of_day_cyclic            +2
-  ├── attach_overnight_features              +4
-  ├── attach_pattern_features                +13   (T7.* breakouts/divergences)
-  ├── attach_engine_features                 +4    (fracdiff + 3 round-pin)
-  ├── attach_l2_deep_features (depth=10)     +50   (10 deep + 40 per-level)
-  ├── attach_vx_features (asof-join)         +7    (mid/zscore/calendar/curvature)
-  ├── attach_gex_for_target                  +5
-  ├── attach_ts_normalizations               +136  (34 BASE × 2 lookbacks × 2 z-types)
-  ├── attach_ema_smoothed                    +16   (8 features × 2 spans)
-  └── assemble_target_panel (V1 labels)      +8    (label, realized_ret, atr, halt flags)
+  load Phase A+B bars (year)             →  90 cols
+  ├── attach_base_microstructure_features    +44
+  ├── attach_session_flags + cyclic + overnight  +11
+  ├── attach_pattern_features                +13
+  ├── attach_engine_features                 +4
+  ├── attach_l2_deep_features (depth=10)     +50
+  ├── attach_ts_normalizations               +136
+  ├── attach_ema_smoothed                    +16
+  └── attach_vx_features                     +20
                                              ─────
-                                             ~378 cols
+                                             ~376 cols
   ```
 
-- **Flags**:
-  - `--year YYYY` (required)
-  - `--out PATH` (required, output directory)
-  - `--label` apply triple-barrier labels
-  - `--no-vx` / `--no-gex` / `--no-l2-deep` skip respective stage if its inputs aren't ready
+### S7. Options feature panel (Phase 2b — GEX-derived per-target features)
+- **Reads**: GEX daily profile parquet (`SPX_gex_profile_{YEAR}.parquet`) + target's bars (just ts + close).
+- **Writes**: `features/options/{INSTR}_{YEAR}.parquet`.
+- **Script**: `scripts/build_options_panel.py`, `build_options_panel.sbatch`.
+- Output schema is just `ts` + GEX columns (≈15 cols) — the close column is dropped to avoid join collision in Phase 3.
+- Only emits a panel for instruments with a configured options-chain mapping (`TARGET_TO_OPTIONS_TICKER`); for V1 that's just `ES → SPX`.
+
+### S8. Single-contract merged panel (Phase 3)
+- **Reads**: `features/futures/{INSTR}_{YEAR}.parquet` + `features/options/{INSTR}_{YEAR}.parquet` (optional).
+- **Writes**: `features/single/{INSTR}_{YEAR}.parquet`.
+- **Script**: `scripts/build_single_panel.py`, `build_single_panel.sbatch`.
+- Left-joins futures + options on ts (futures is authoritative for duplicates), applies V1 triple-barrier labels, drops warmup/halt-truncated rows.
+- Final 2024 ES panel: ~9,970 valid labeled rows × 396 cols.
+
+### S9. Cross-sectional panel (Phase 4)
+- **Reads**: `features/single/{INSTR}_{YEAR}.parquet` for all 30 instruments.
+- **Writes**: `features/cross/{TARGET}_{YEAR}.parquet`.
+- **Script**: `scripts/build_cross_panel.py`, `build_cross_panel.sbatch` (array=0-19 over 4 targets × 5 years).
+- Adds Gauss-Rank universe + per-asset-class ranks, synthetic DXY, rates curve, risk-on/off, cross-asset rolling correlations on top of target's single panel.
 
 ---
 
@@ -159,9 +188,11 @@ ssh bigred 'cd ~/us_futures && python -u scripts/build_5sec_bars.py \
     --instrument ES --start 2024-03-01 --end 2024-03-01 \
     --out-root /tmp/bars_5s_smoke'
 
-# Full ES panel — one year
-ssh bigred 'cd ~/us_futures && python -u scripts/build_es_panel.py \
-    --year 2024 --out /tmp/es_panel_smoke --label'
+# Full ES single panel chain — one year
+ssh bigred 'cd ~/us_futures && python -u scripts/build_futures_panel.py --instrument ES --year 2024 --out /tmp/es_smoke'
+ssh bigred 'cd ~/us_futures && python -u scripts/build_options_panel.py --instrument ES --year 2024 --out /tmp/es_smoke'
+ssh bigred 'cd ~/us_futures && python -u scripts/build_single_panel.py  --instrument ES --year 2024 --out /tmp/es_smoke'
+# Cross panel needs single panels for all 30 instruments first; smoke after multi-instrument run
 ```
 
 Local unit tests (always run before pushing changes):
@@ -210,9 +241,10 @@ under `[col-summary]`.
 
 ## Common pitfalls
 
-- **Time precision auto-detect**: Algoseek futures TAQ uses `HHMMSSnnnnnnnnn` (15 chars, ns), VIX TAQ uses `HHMMSSmmm` (9 chars, ms). `src/data/ingest._parse_ts` auto-detects from max string length. Don't hard-code the format.
+- **Time precision auto-detect**: Algoseek futures TAQ uses `HHMMSSnnnnnnnnn` (15 chars, ns), VIX TAQ uses `HHMMSSmmm` (9 chars, ms). `src/data/ingest._parse_ts` auto-detects from max string length AND coerces the result to `datetime[ns, UTC]` so all bars have a consistent ts dtype across data sources. (Without the final coercion, polars' `pl.duration(milliseconds=…)` promotes ns→μs and asof-joins between VX and futures bars fail with `SchemaError`.)
 - **VIX has no aggressor classification**: only `TRADE` (no `TRADE AGRESSOR ON BUY/SELL`). VX bars will have `buys_qty=sells_qty=0`. VX features use mid/spread only — don't compute OFI from VX.
 - **Polars CSV i64 inference on depth files**: depth's L{k}Price columns can be inferred as i64 from early null/zero rows, then crash on later fractional prices. `src/data/ingest.read_depth` forces `Float64` via `schema_overrides` — keep that.
 - **`group_by_dynamic` with empty trade days**: zero-trade-day files (holidays, halts) make `build_5sec_bars_core` return zero rows. The bar builders treat that as soft-skip (return 0,0; log `[empty]`); they do NOT raise.
 - **Front-N for VX**: liquidity-rank ordering breaks near roll. `roll.front_n` parses calendar expiry for VX and orders by `(year, month)` ascending.
-- **No incremental panel rebuild**: `build_es_panel.py` rewrites the full panel parquet every run. If only one feature group changes, the entire pipeline re-runs (~5-10min/year). Plan around this when iterating on feature additions.
+- **`src.features.panel` is a backward-compat facade**: the original monolithic module was split into `single_contract.py` / `external_sources.py` / `cross_sectional.py` / `labeling.py`. New code should import from those directly; `panel.py` re-exports for legacy callers and may be removed in a future cleanup.
+- **Stage-wise rebuilds**: each phase's output is a parquet. Rebuilding a single stage (e.g., re-running `build_futures_panel.py` after a feature change) reuses the options panel from disk; only the changed stage runs. Use this for fast feature iteration.
