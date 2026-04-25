@@ -139,6 +139,9 @@ def main() -> int:
                    help="Policy for halt-crossing bars: drop or truncate forward window")
     p.add_argument("--min-effective-T", type=int, default=2,
                    help="Floor on truncated effective T (bars below this get dropped)")
+    p.add_argument("--partition-minutes", type=int, default=None,
+                   help="TC-ATR partition granularity (default = bar_minutes; "
+                        "use 30 for 30-min bucketing)")
     args = p.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -165,6 +168,7 @@ def main() -> int:
         halt_aware=args.halt_aware,
         halt_mode=args.halt_mode,
         min_effective_T=args.min_effective_T,
+        partition_minutes=args.partition_minutes,
     )
     diag = per_hour_stats(labeled)
 

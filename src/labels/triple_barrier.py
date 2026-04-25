@@ -52,6 +52,7 @@ def attach_atr_time_conditional(
     bars: pl.DataFrame,
     lookback_days: int = 30,
     bar_minutes: int = 15,
+    partition_minutes: int | None = None,
     high_col: str = "high",
     low_col: str = "low",
     close_col: str = "close",
@@ -67,14 +68,26 @@ def attach_atr_time_conditional(
     Sizes barriers to the local intraday vol regime, fixing calendar-ATR
     mis-sizing at low-volume off-hours and high-volume RTH open.
 
+    Args:
+        bar_minutes: bar duration in minutes (15 for 15-min bars).
+        partition_minutes: granularity at which to partition for the
+            same-bar-of-day rolling mean. Default = bar_minutes (one
+            partition per bar). Larger values (e.g., 30) merge adjacent
+            bars-of-day into a single partition — gains stability at the
+            cost of cross-slot blurring. Must divide 60 cleanly.
+
     Note: `polars.Expr.rolling_mean(...).over(<expression>)` does not partition
     correctly in current polars versions; we materialize bar_of_day as an
     explicit column and use `.over("bar_of_day")` (column name).
     """
-    bars_per_hour = 60 // bar_minutes
+    if partition_minutes is None:
+        partition_minutes = bar_minutes
+    if 60 % partition_minutes != 0:
+        raise ValueError(f"partition_minutes={partition_minutes} must divide 60")
+    parts_per_hour = 60 // partition_minutes
     et = pl.col(ts_col).dt.convert_time_zone("US/Eastern")
     df = bars.with_columns(
-        (et.dt.hour() * bars_per_hour + et.dt.minute() // bar_minutes).alias("_bar_of_day")
+        (et.dt.hour() * parts_per_hour + et.dt.minute() // partition_minutes).alias("_bar_of_day")
     )
     prev_close = pl.col(close_col).shift(1)
     df = df.with_columns(
@@ -237,6 +250,7 @@ def triple_barrier_labels(
     halt_aware: bool = True,
     halt_mode: str = "drop",
     min_effective_T: int = 2,
+    partition_minutes: int | None = None,
     open_col: str = "open",
     high_col: str = "high",
     low_col: str = "low",
@@ -279,6 +293,7 @@ def triple_barrier_labels(
             bars,
             lookback_days=lookback_days,
             bar_minutes=bar_minutes,
+            partition_minutes=partition_minutes,
             high_col=high_col, low_col=low_col, close_col=close_col, ts_col=ts_col,
             out_col="atr",
         )
