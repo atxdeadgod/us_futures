@@ -321,25 +321,49 @@ def attach_l2_deep_features(
     Adds composite (10) + per-level (40) features. See BUILD_PIPELINE.md
     column-inventory for the full list.
     """
+    # Effective depth: use only levels for which both bid_sz_Lk AND ask_sz_Lk
+    # exist on the frame. Older Phase A+B parquets (2020 - mid-2023) lack
+    # bid_sz_L10 / ask_sz_L10 due to an upstream Algoseek CSV header typo
+    # ("Leve101Size") in those years. We silently downgrade the effective depth
+    # so the older bars still produce a valid (slightly narrower) L2 feature
+    # set rather than crashing.
+    cols = set(bars.columns)
+    eff_depth = depth
+    while eff_depth >= 1:
+        if (f"bid_sz_L{eff_depth}" in cols and f"ask_sz_L{eff_depth}" in cols
+                and f"bid_px_L{eff_depth}" in cols and f"ask_px_L{eff_depth}" in cols):
+            break
+        eff_depth -= 1
+    if eff_depth < 1:
+        raise ValueError("attach_l2_deep_features needs at least L1 book columns")
+
     aggs = [
-        l2_features.cumulative_imbalance(depth=depth).alias(f"cum_imbalance_d{depth}"),
-        l2_features.distance_weighted_imbalance(depth=depth).alias(f"dw_imbalance_d{depth}"),
-        l2_features.depth_weighted_spread(depth=depth).alias(f"depth_weighted_spread_d{depth}"),
-        l2_features.liquidity_adjusted_spread(depth=depth).alias(f"liquidity_adjusted_spread_d{depth}"),
+        l2_features.cumulative_imbalance(depth=eff_depth).alias(f"cum_imbalance_d{depth}"),
+        l2_features.distance_weighted_imbalance(depth=eff_depth).alias(f"dw_imbalance_d{depth}"),
+        l2_features.depth_weighted_spread(depth=eff_depth).alias(f"depth_weighted_spread_d{depth}"),
+        l2_features.liquidity_adjusted_spread(depth=eff_depth).alias(f"liquidity_adjusted_spread_d{depth}"),
         l2_features.spread_acceleration().alias("spread_acceleration"),
-        l2_features.herfindahl_hirschman_index(side="bid", depth=depth).alias(f"hhi_bid_d{depth}"),
-        l2_features.herfindahl_hirschman_index(side="ask", depth=depth).alias(f"hhi_ask_d{depth}"),
-        deep_ofi_features.deep_ofi(max_depth=depth, decay=0.0).alias(f"deep_ofi_d{depth}_decay0"),
-        deep_ofi_features.deep_ofi(max_depth=depth, decay=0.3).alias(f"deep_ofi_d{depth}_decay03"),
+        l2_features.herfindahl_hirschman_index(side="bid", depth=eff_depth).alias(f"hhi_bid_d{depth}"),
+        l2_features.herfindahl_hirschman_index(side="ask", depth=eff_depth).alias(f"hhi_ask_d{depth}"),
+        deep_ofi_features.deep_ofi(max_depth=eff_depth, decay=0.0).alias(f"deep_ofi_d{depth}_decay0"),
+        deep_ofi_features.deep_ofi(max_depth=eff_depth, decay=0.3).alias(f"deep_ofi_d{depth}_decay03"),
         l2_features.spread_zscore(depth=1, window=spread_z_window).alias(f"spread_zscore_w{spread_z_window}"),
     ]
+    # Per-level cols use the requested depth — but only emit cols whose source
+    # data is on the frame. Missing levels are silently skipped.
     for k in range(1, depth + 1):
-        aggs.append(l2_features.volume_imbalance_at(k=k).alias(f"volume_imbalance_L{k}"))
-        aggs.append(l2_features.basic_spread_at(k=k).alias(f"basic_spread_L{k}"))
-        aggs.append(deep_ofi_features.ofi_at_level(k=k).alias(f"ofi_at_L{k}"))
+        if f"bid_sz_L{k}" in cols and f"ask_sz_L{k}" in cols:
+            aggs.append(l2_features.volume_imbalance_at(k=k).alias(f"volume_imbalance_L{k}"))
+        if f"bid_px_L{k}" in cols and f"ask_px_L{k}" in cols:
+            aggs.append(l2_features.basic_spread_at(k=k).alias(f"basic_spread_L{k}"))
+            if f"bid_sz_L{k}" in cols and f"ask_sz_L{k}" in cols:
+                aggs.append(deep_ofi_features.ofi_at_level(k=k).alias(f"ofi_at_L{k}"))
         if k <= 5:
-            aggs.append(l2_features.order_count_imbalance_at(k=k).alias(f"order_count_imbalance_L{k}"))
-            aggs.append(l2_features.order_size_imbalance_at(k=k).alias(f"order_size_imbalance_L{k}"))
+            if f"bid_ord_L{k}" in cols and f"ask_ord_L{k}" in cols:
+                aggs.append(l2_features.order_count_imbalance_at(k=k).alias(f"order_count_imbalance_L{k}"))
+            if (f"bid_sz_L{k}" in cols and f"ask_sz_L{k}" in cols
+                    and f"bid_ord_L{k}" in cols and f"ask_ord_L{k}" in cols):
+                aggs.append(l2_features.order_size_imbalance_at(k=k).alias(f"order_size_imbalance_L{k}"))
 
     # T1.29 — Liquidity migration: bar-to-bar size deltas across levels.
     # Positive bid_migration_L1_to_L2 = liquidity moved from L1 to L2 (queue
@@ -347,6 +371,8 @@ def attach_l2_deep_features(
     # on the ask side. L1_to_L3 covers wider migrations.
     for side in ("bid", "ask"):
         for to_level in (2, 3):
+            if f"{side}_sz_L1" not in cols or f"{side}_sz_L{to_level}" not in cols:
+                continue
             sz_l1 = pl.col(f"{side}_sz_L1")
             sz_lk = pl.col(f"{side}_sz_L{to_level}")
             d1 = sz_l1 - sz_l1.shift(1)  # bar-to-bar Δ at L1

@@ -188,6 +188,12 @@ def read_depth(cf: ContractFile) -> pl.DataFrame:
         raise FileNotFoundError(cf.path)
     price_cols_float = {f"L{k}Price": pl.Float64 for k in range(1, 11)}
     df = pl.read_csv(cf.path, schema_overrides=price_cols_float)
+    # Algoseek shipped depth CSVs with the L10Size column header misspelled as
+    # "Leve101Size" for ~3 years (2020 - mid-2023). The values are correct; only
+    # the column name is malformed. Rename to the canonical L10Size if present,
+    # so all downstream code can rely on the consistent schema.
+    if "Leve101Size" in df.columns and "L10Size" not in df.columns:
+        df = df.rename({"Leve101Size": "L10Size"})
     return _parse_ts(df)
 
 
