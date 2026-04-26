@@ -29,7 +29,7 @@ mkdir -p "$OUT_ROOT/$INSTR/$HORIZON"
 
 echo "=== Phase E bars  instr=$INSTR  range=[$START..$END]  horizon=$HORIZON ==="
 
-python3 -u "$HOME/us_futures/scripts/build_phase_e_bars.py" \
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_phase_e_bars.py \
     --instrument "$INSTR" \
     --start "$START" --end "$END" \
     --horizon "$HORIZON" \

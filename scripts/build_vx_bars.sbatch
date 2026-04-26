@@ -28,7 +28,7 @@ HORIZON="${HORIZON:-15m}"
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/bars_phase_a}"
 ALGOSEEK_ROOT="${ALGOSEEK_ROOT:-/N/project/ksb-finance-backtesting/data/algoseek_futures}"
 
-python3 -u "$HOME/us_futures/scripts/build_vx_bars.py" \
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_vx_bars.py \
     --start "$START" --end "$END" \
     --horizon "$HORIZON" \
     --out-root "$OUT_ROOT" \

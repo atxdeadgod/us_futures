@@ -28,7 +28,7 @@ END="${END:-2024-12-31}"
 PA_ROOT="${PA_ROOT:-/N/project/ksb-finance-backtesting/data/bars_phase_a}"
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/bars_phase_ab}"
 
-python3 -u "$HOME/us_futures/scripts/build_l2_bars.py" \
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_l2_bars.py \
     --instrument "$INSTR" \
     --start "$START" --end "$END" \
     --bars-phase-a-root "$PA_ROOT" \

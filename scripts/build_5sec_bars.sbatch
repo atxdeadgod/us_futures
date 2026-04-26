@@ -25,7 +25,7 @@ START="${START:-2020-01-01}"
 END="${END:-2024-12-31}"
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/bars_5sec}"
 
-python3 -u "$HOME/us_futures/scripts/build_5sec_bars.py" \
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_5sec_bars.py \
     --instrument "$INSTR" \
     --start "$START" --end "$END" \
     --out-root "$OUT_ROOT"
