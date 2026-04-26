@@ -42,7 +42,13 @@ def _stitch_per_day_parquets(root: Path, instr: str, horizon: str,
     files = sorted(folder.glob(f"{instr}_{year}*_{horizon}.parquet"))
     if not files:
         raise FileNotFoundError(f"No {instr} parquets in {folder} for year {year}")
-    return pl.concat([pl.read_parquet(p) for p in files], how="vertical_relaxed").sort("ts")
+    # diagonal_relaxed: aligns columns by name, fills missing with nulls, AND
+    # relaxes dtype mismatches. Necessary because some years' bars have a
+    # narrower schema than others (e.g., 2020-Apr2023 Phase A+B lacks
+    # bid_sz_L10/ask_sz_L10 due to the Algoseek "Leve101Size" header typo).
+    # Plain vertical_relaxed only relaxes dtypes, not column sets, and would
+    # crash with "schema lengths differ".
+    return pl.concat([pl.read_parquet(p) for p in files], how="diagonal_relaxed").sort("ts")
 
 
 def main() -> int:

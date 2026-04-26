@@ -58,7 +58,7 @@ def _stitch_per_day_parquets(root: Path, instr: str, horizon: str,
     files = sorted(folder.glob(f"{instr}_{year}*_{horizon}.parquet"))
     if not files:
         raise FileNotFoundError(f"No {instr} parquets in {folder} for year {year}")
-    return pl.concat([pl.read_parquet(p) for p in files], how="vertical_relaxed").sort("ts")
+    return pl.concat([pl.read_parquet(p) for p in files], how="diagonal_relaxed").sort("ts")
 
 
 def main() -> int:

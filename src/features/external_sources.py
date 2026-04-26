@@ -120,7 +120,7 @@ def attach_gex_for_target(
         return bars
     daily = pl.concat(
         [pl.scan_parquet(p) for p in daily_gex_paths],
-        how="vertical_relaxed",
+        how="diagonal_relaxed",
     ).collect()
     if es_spx_basis is None:
         es_spx_basis = daily.select("date").with_columns(pl.lit(0.0).alias("basis"))
