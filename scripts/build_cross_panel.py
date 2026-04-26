@@ -57,11 +57,22 @@ CS_VALUE_COLS: list[str] = [
 ]
 
 
-def _load_single_panel(out_root: Path, instr: str, year: int) -> pl.DataFrame | None:
+def _load_single_panel(
+    out_root: Path, instr: str, year: int,
+    columns: list[str] | None = None,
+) -> pl.DataFrame | None:
+    """Load a single panel parquet. If `columns` is given, scan-read only
+    those columns from disk — much cheaper than reading 280-446 cols then
+    selecting. Critical for the 30-instrument cross-panel build, which only
+    needs ts + ~14 BASE_VALUE_COLS per instrument.
+    """
     path = out_root / "single" / f"{instr}_{year}.parquet"
     if not path.exists():
         return None
-    return pl.read_parquet(path).sort("ts")
+    if columns is None:
+        return pl.read_parquet(path).sort("ts")
+    # scan-and-select reads only requested columns from disk
+    return pl.scan_parquet(path).select(columns).sort("ts").collect()
 
 
 def main() -> int:
@@ -84,19 +95,26 @@ def main() -> int:
 
     per_instrument: dict[str, pl.DataFrame] = {}
     missing: list[str] = []
+    # First pass: lightweight schema probe via pq metadata to know which CS_VALUE_COLS
+    # each panel actually has. Avoids loading 30 full panels.
+    import pyarrow.parquet as pq
     for instr in cross_sectional.ALL_INSTRUMENTS:
-        df = _load_single_panel(out_root, instr, args.year)
-        if df is None:
+        path = out_root / "single" / f"{instr}_{args.year}.parquet"
+        if not path.exists():
             missing.append(instr)
             continue
-        avail = [c for c in CS_VALUE_COLS if c in df.columns]
+        schema = pq.read_schema(path)
+        avail = [c for c in CS_VALUE_COLS if c in schema.names]
         if not avail:
             missing.append(instr)
             continue
-        per_instrument[instr] = df.select(["ts"] + avail)
+        # Scan-read ONLY ts + needed value cols from disk (cheap)
+        df = _load_single_panel(out_root, instr, args.year, columns=["ts"] + avail)
+        per_instrument[instr] = df
     if missing:
         print(f"[warn] missing single panels for: {missing}")
-    print(f"[wide] joining {len(per_instrument)} instrument frames on ts")
+    total_rows = sum(df.height for df in per_instrument.values())
+    print(f"[wide] joining {len(per_instrument)} instrument frames on ts  total_rows={total_rows:,}")
 
     wide = cross_sectional.build_wide_cross_asset_frame(
         per_instrument, base_value_cols=CS_VALUE_COLS,

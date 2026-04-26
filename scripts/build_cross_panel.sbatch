@@ -27,5 +27,11 @@ conda activate bhft
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/features}"
 mkdir -p "$OUT_ROOT/cross"
 
-python3 -u "$HOME/us_futures/scripts/build_cross_panel.py" \
+# Bound polars memory footprint for the 30-instrument wide-join. Without
+# these, polars' streaming engine spins up many parallel tasks each holding
+# working buffers, OOM-killing the job at 128 GB allocated.
+export POLARS_MAX_THREADS=1
+export POLARS_STREAMING_CHUNK_SIZE=10000
+
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_cross_panel.py \
     --target "$TARGET" --year "$YEAR" --out "$OUT_ROOT"

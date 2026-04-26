@@ -60,22 +60,60 @@ def build_wide_cross_asset_frame(
     Outer-joins on ts so a missing day for one contract doesn't drop other
     contracts' data; nulls propagate.
     """
-    frames = []
+    # Build the master ts grid first (union of all unique ts across all
+    # 30 instrument frames), then LEFT-join each renamed instrument frame
+    # onto it. This keeps memory bounded by O(unique_ts × total_cols).
+    #
+    # Why not pl.concat(..., how="full", coalesce=True) chained eagerly /
+    # lazily? Both OOM at >128 GB on the 30-instrument join even though the
+    # final wide frame is only ~80 MB raw (job 8894500_4 + 8894632_4 hit
+    # OUT_OF_MEMORY in 1-2 min). The full-outer chain accumulates polars
+    # plan state and intermediates that scale poorly with N. Master-grid
+    # + left-join is simpler and bounded.
+    import sys
+    frames: list[pl.DataFrame] = []
+    ts_dtype = None
     for instr, df in per_instrument_frames.items():
         avail = [c for c in base_value_cols if c in df.columns]
         if not avail:
             continue
+        if ts_dtype is None:
+            ts_dtype = df.schema[ts_col]
         renamed = {c: f"{instr}_{c}" for c in avail}
-        sub = df.select([ts_col] + avail).rename(renamed)
+        # Dedupe on ts: some single panels have duplicate ts rows (likely from
+        # the futures+options join when options has multiple rows per bar).
+        # Without dedupe, sequential left-joins blow up cartesian-style: an
+        # earlier diagnostic run saw the wide frame grow 24K → 30M rows after
+        # 16 joins (job 8895054_4). Take the first row per ts; downstream
+        # stat features treat ts as unique key.
+        sub = (
+            df.select([ts_col] + avail)
+            .rename(renamed)
+            .unique(subset=[ts_col], keep="first")
+        )
         frames.append(sub)
+        print(f"  [wide] {instr}: rows={sub.height} cols={len(sub.columns)}", flush=True)
 
     if not frames:
         raise ValueError("No per-instrument frames had any of the requested base_value_cols")
 
-    wide = frames[0]
-    for f in frames[1:]:
-        wide = wide.join(f, on=ts_col, how="full", coalesce=True)
-    return wide.sort(ts_col)
+    # Master ts grid = sorted unique union across all frames
+    print(f"  [wide] building master ts grid from {len(frames)} frames...", flush=True)
+    master_ts = (
+        pl.concat([f.select(ts_col) for f in frames])
+        .unique()
+        .sort(ts_col)
+    )
+    print(f"  [wide] master ts grid: rows={master_ts.height}", flush=True)
+
+    # Left-join each instrument's narrowed frame onto the master grid
+    wide = master_ts
+    for i, f in enumerate(frames):
+        wide = wide.join(f, on=ts_col, how="left")
+        if i % 5 == 0 or i == len(frames) - 1:
+            print(f"  [wide] join {i+1}/{len(frames)}: rows={wide.height} cols={len(wide.columns)}", flush=True)
+
+    return wide
 
 
 # ---------------------------------------------------------------------------
