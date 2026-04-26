@@ -1,47 +1,142 @@
 # Feature-Panel Build Pipeline
 
-**Purpose**: one place to look up *how to build the V1 ES feature panel from scratch*.
-**Scope**: V1 = single-contract ES, ~396 features per 15-min bar (with VX + GEX wired).
+**Purpose**: one place to look up *how to build the full V1 feature panel from
+scratch, end-to-end, for all 4 trading instruments and the 26 macro-feed
+contracts*.
+**Scope**: V1 = ES/NQ/RTY/YM with the **full feature set** (Phase A + Phase A+B
++ 5-sec sub-bar engines + Phase E + VX + GEX) plus 26 macro-feed contracts
+with bar-derived features only — together feeding cross-sectional features
+back onto each trading target.
 **Companion docs**: `FEATURES.md` (the catalog of what each feature means),
 `LABELING_V1_SUMMARY.md` (the triple-barrier label spec), and
 `REFACTOR.md` (the 4-phase architecture this pipeline follows).
 
 ---
 
-## TL;DR — rebuild end-to-end
+## TL;DR — rebuild end-to-end (master sequence)
 
-Assuming raw Algoseek mirror is already on bigred at
-`/N/project/ksb-finance-backtesting/data/algoseek_futures/{taq,depth,vix}/...`:
+Assuming raw Algoseek mirror is on bigred at
+`/N/project/ksb-finance-backtesting/data/algoseek_futures/{taq,depth,vix}/...`
+and the SPX/NDX/RUT/DJX/SPY options chains are in
+`/N/project/.../spx_options_chain/`. Each `INSTR=X` env override targets one
+instrument; the sbatches are array=0-4 over years 2020-2024 unless noted.
+
+> **Cluster note**: every sbatch is portable across bigred and quartz (same
+> account, shared filesystems, absolute python paths). Submit on whichever
+> cluster has capacity. Cross-cluster SLURM dependencies don't work, so keep
+> a chain (futures → options → single) on one cluster.
 
 ```bash
-# Phase 1: Bars (independent, can run in parallel)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_phase_a_bars.sbatch'      # 30 instruments × 15m  (~6h, array of 30)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_l2_bars.sbatch'           # ES/NQ/RTY/YM Phase A+B (~3h, array of 4)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_vx_bars.sbatch'           # VX1/VX2/VX3 15m       (~75min)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_5sec_bars.sbatch'         # ES 5-sec (for VPIN/Hawkes; ~60min)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_phase_e_bars.sbatch'      # ES Phase E exec/cancel/quote-count (~2h)
+########################################################################
+# Phase 1 — Bar builds (raw Algoseek → per-day parquets)
+# All independent within Phase 1; can run in parallel.
+########################################################################
 
-# Phase 2a: GEX daily profile (depends on SPX options chain at /N/.../spx_options_chain/)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_gex_features.sbatch'      # SPX+SPY × 5 yrs  (~15min, array of 10)
+# (1a) Phase A bars: 30 instruments × 15-min OHLCV+aggressor+L1+CVD+spread sub-bar
+sbatch scripts/build_phase_a_bars.sbatch                                       # array=0-29, ~6h
 
-# Phase 2b: per-source feature panels (independent of each other)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_futures_panel.sbatch'     # bar-derived + VX, ES × 5 yrs  (~30min, array of 5)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_options_panel.sbatch'     # GEX-derived, ES × 5 yrs       (~10min, array of 5)
+# (1b) Phase A+B bars: 4 trading instruments + L1-L10 book snapshot
+INSTR=ES  sbatch scripts/build_l2_bars.sbatch                                   # array=0-4, ~45min
+INSTR=NQ  sbatch scripts/build_l2_bars.sbatch
+INSTR=RTY sbatch scripts/build_l2_bars.sbatch
+INSTR=YM  sbatch scripts/build_l2_bars.sbatch
+# (Or single sbatch if its array covers all 4 — check the .sbatch header.)
 
-# Phase 3: single-contract merged panel + V1 labels
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_single_panel.sbatch'      # join futures+options + label, ES × 5 yrs (~10min, array of 5)
+# (1c) VX bars: VX1/VX2/VX3 (front-3 monthly VIX futures)
+sbatch scripts/build_vx_bars.sbatch                                            # single task, ~75min
 
-# Phase 4: cross-sectional features (only after building single panels for ALL 30 instruments)
-ssh bigred 'cd ~/us_futures && sbatch scripts/build_cross_panel.sbatch'       # 4 trading instruments × 5 yrs (~30min, array of 20)
+# (1d) 5-sec bars: ALL 4 trading instruments (needed for VPIN + Hawkes)
+INSTR=ES  sbatch scripts/build_5sec_bars.sbatch                                 # ~60min each
+INSTR=NQ  sbatch scripts/build_5sec_bars.sbatch
+INSTR=RTY sbatch scripts/build_5sec_bars.sbatch
+INSTR=YM  sbatch scripts/build_5sec_bars.sbatch
+
+# (1e) Phase E bars: ALL 4 trading instruments (exec quality + cancel proxy + quote dir)
+INSTR=ES  sbatch scripts/build_phase_e_bars.sbatch                              # ~3-4h each
+INSTR=NQ  sbatch scripts/build_phase_e_bars.sbatch
+INSTR=RTY sbatch scripts/build_phase_e_bars.sbatch
+INSTR=YM  sbatch scripts/build_phase_e_bars.sbatch
+
+########################################################################
+# Phase 2a — GEX daily profile (options chain → per-day GEX parquet)
+# Run after SPX/NDX/RUT/DJX chains are downloaded.
+########################################################################
+
+TICKERS=SPX,SPY,NDX,RUT,DJX sbatch scripts/build_gex_features.sbatch           # ~15-30min total
+
+########################################################################
+# Phase 2b — Per-source feature panels (per instrument, per year)
+# Submit chained: futures must complete before options/single for that instrument.
+########################################################################
+
+# Dispatch script (run from any cluster); captures job IDs for chaining
+declare -A FUT_JOBS OPT_JOBS
+ALL_INSTRUMENTS=(ES NQ RTY YM 6A 6B 6C 6E 6J BZ CL HO NG RB \
+                 GC HG PA PL SI SR3 TN ZB ZF ZN ZT ZC ZL ZM ZS ZW)
+TRADING=(ES NQ RTY YM)
+
+# 30 futures panel jobs (one sbatch per instrument, array=0-4 over years)
+for INSTR in "${ALL_INSTRUMENTS[@]}"; do
+    JID=$(INSTR=$INSTR sbatch --parsable scripts/build_futures_panel.sbatch)
+    FUT_JOBS[$INSTR]=$JID
+done
+
+# 4 options panel jobs (only for trading 4) — chained on each instrument's futures
+for INSTR in "${TRADING[@]}"; do
+    JID=$(INSTR=$INSTR sbatch --parsable \
+        --dependency=afterok:${FUT_JOBS[$INSTR]} \
+        scripts/build_options_panel.sbatch)
+    OPT_JOBS[$INSTR]=$JID
+done
+
+########################################################################
+# Phase 3 — Single-contract merged panel + V1 labels (per instrument)
+# Joins futures + options on ts, applies V1 triple-barrier labels (trading 4 only).
+########################################################################
+
+for INSTR in "${ALL_INSTRUMENTS[@]}"; do
+    DEPS="afterok:${FUT_JOBS[$INSTR]}"
+    if [[ -n "${OPT_JOBS[$INSTR]:-}" ]]; then
+        DEPS="${DEPS}:${OPT_JOBS[$INSTR]}"
+    fi
+    INSTR=$INSTR sbatch --dependency=$DEPS scripts/build_single_panel.sbatch
+done
+
+########################################################################
+# Phase 4 — Cross-sectional panel (only after ALL 30 single panels exist)
+# Per-target: joins all 30 single panels on ts → CS ranks + composites + interactions.
+########################################################################
+
+sbatch scripts/build_cross_panel.sbatch    # array=0-19, 4 targets × 5 years, ~30min
 ```
 
-Outputs:
-- `/N/.../features/futures/{INSTR}_{YEAR}.parquet`   (Phase 2b output, bar-derived)
-- `/N/.../features/options/{INSTR}_{YEAR}.parquet`   (Phase 2b output, GEX)
-- `/N/.../features/single/{INSTR}_{YEAR}.parquet`    (Phase 3 output, merged + labeled)
-- `/N/.../features/cross/{TARGET}_{YEAR}.parquet`    (Phase 4 output, with CS features)
+**Outputs**:
+- `/N/.../bars_phase_a/{INSTR}/15m/...`           (Phase 1a)
+- `/N/.../bars_phase_ab/{INSTR}/15m/...`          (Phase 1b)
+- `/N/.../bars_phase_a/VX{1,2,3}/15m/...`         (Phase 1c)
+- `/N/.../bars_5sec/{INSTR}/5s/...`               (Phase 1d)
+- `/N/.../bars_phase_e/{INSTR}/15m/...`           (Phase 1e)
+- `/N/.../gex_features/{TICKER}_gex_profile_{YEAR}.parquet`  (Phase 2a)
+- `/N/.../features/futures/{INSTR}_{YEAR}.parquet`  (Phase 2b)
+- `/N/.../features/options/{INSTR}_{YEAR}.parquet`  (Phase 2b — trading 4 only)
+- `/N/.../features/single/{INSTR}_{YEAR}.parquet`   (Phase 3)
+- `/N/.../features/cross/{TARGET}_{YEAR}.parquet`   (Phase 4)
 
-Local smoke (single year, single day) before any SLURM job — see "Smoke tests" below.
+**Wall time estimate (cold start, with parallel cluster capacity)**:
+- Phase 1: ~6h longest pole (Phase A bars 30-instrument array)
+- Phase 2a: ~30 min
+- Phase 2b: ~1-2h (ES is the long pole because of Hawkes)
+- Phase 3: ~30 min
+- Phase 4: ~30 min
+- **Total ~8-10h** for a from-scratch full rebuild.
+
+**Wall time for INCREMENTAL adds (e.g., extending sub-bar engines + Phase E to NQ/RTY/YM after they were ES-only)**:
+- 5-sec bars × 3 instruments parallel: ~60 min
+- Phase E × 3 instruments parallel: ~3-4h
+- Re-run futures + single for those 3 instruments: ~30 min
+- Total ~5h additional.
+
+**Pre-flight smoke for a single instrument**: see "Smoke tests" below — always run this before submitting a multi-year array job.
 
 ---
 
@@ -114,16 +209,17 @@ input dependencies. SLURM array tasks are independent days × instruments.
 - **Script**: `scripts/build_vx_bars.py`, `build_vx_bars.sbatch` (single task, 3 slots × ~1300 days).
 - **Status**: 🟡 in progress (job 6921146).
 
-### S4. 5-sec bars (ES, for sub-bar engines)
+### S4. 5-sec bars (4 trading instruments — needed for VPIN + Hawkes engines)
 - **Reads**: same as Phase A.
-- **Writes**: `bars_5sec/ES/5s/ES_{YYYYMMDD}_5s.parquet` (~15K rows/day × 29 cols).
+- **Writes**: `bars_5sec/{INSTR}/5s/{INSTR}_{YYYYMMDD}_5s.parquet` (~15K rows/day × 29 cols) for ES, NQ, RTY, YM.
 - **Used by**: VPIN volume buckets (`engines.vpin_volume_buckets`), Hawkes intensity recursion (`engines.hawkes_intensity_recursive`); wired into `build_futures_panel.py` via `sub_bar_engines.attach_sub_bar_engine_features`.
-- **Script**: `scripts/build_5sec_bars.py`, `build_5sec_bars.sbatch`.
-- **Status**: ✅ done (1299 days for ES).
+- **Script**: `scripts/build_5sec_bars.py`, `build_5sec_bars.sbatch` (per-instrument single-task; override `INSTR` via env).
+- **Submission**: 4 separate sbatch submissions, one per trading instrument; runs in parallel.
+- **Status**: ES ✅ (1299 days). NQ/RTY/YM ⏳ pending (to be built post current multi-instrument single-panel run).
 
-### S4b. Phase E bars (ES, execution-quality + cancel-proxy + quote-event + quote-direction aggregates)
+### S4b. Phase E bars (4 trading instruments — execution-quality + cancel-proxy + quote-event + quote-direction aggregates)
 - **Reads**: raw TAQ + depth (Algoseek).
-- **Writes**: `bars_phase_e/ES/15m/ES_{YYYYMMDD}_15m.parquet` (24 cols).
+- **Writes**: `bars_phase_e/{INSTR}/15m/{INSTR}_{YYYYMMDD}_15m.parquet` (24 cols) for ES, NQ, RTY, YM.
 - **Cols**:
   - Effective spread: eff_spread_{sum,weight,count,buy_sum,buy_weight,sell_sum,sell_weight} (T1.35-T1.37 prereqs)
   - Large trades: n_large_trades, large_trade_volume (T1.23 prereqs)
@@ -133,16 +229,23 @@ input dependencies. SLURM array tasks are independent days × instruments.
   - Quote count: quote_update_count (T1.24 prereq)
   - **Quote direction (T1.25 prereqs)**: bid_up_count, bid_down_count, ask_up_count, ask_down_count
 - **Used by**: `single_contract.attach_phase_e_features` to derive: vwap_eff_spread + asymmetry (T1.35-T1.37), large_trade_volume_share (T1.23), hidden_absorption_ratio (T1.47/T7.12), cancel_to_trade_ratio (T1.43), quote_to_trade_ratio (T1.24), **quote_movement_directionality (T1.25)**, **side_cond_ask_resilience_buy / side_cond_bid_resilience_sell (T1.28)**.
-- **Script**: `scripts/build_phase_e_bars.py`, `build_phase_e_bars.sbatch`.
+- **Script**: `scripts/build_phase_e_bars.py`, `build_phase_e_bars.sbatch` (per-instrument single-task; override `INSTR` via env).
+- **Submission**: 4 separate sbatch submissions, one per trading instrument; runs in parallel.
+- **Status**: ES ✅ (1287 days; 8 days lacked upstream Algoseek depth files). NQ/RTY/YM ⏳ pending.
 
   Note: T1.29 liquidity_migration is NOT in Phase E — it's derived directly from Phase A+B's L1-L5 cols via bar-to-bar deltas in `attach_l2_deep_features`.
 
-### S5. GEX daily profile (SPX, SPY)
+### S5. GEX daily profile (SPX, SPY, NDX, RUT, DJX)
 - **Reads**: `spx_options_chain/{TICKER}_{YEAR}.parquet` (WRDS OptionMetrics).
 - **Writes**: `gex_features/{TICKER}_gex_profile_{YEAR}.parquet`.
 - **Cols**: total_gex, gex_sign, zero_gamma_strike, max_call_oi_strike, max_put_oi_strike, gex_0dte_share, gex_0dte_only, gex_without_0dte.
-- **Script**: `scripts/build_gex_features.py`, `build_gex_features.sbatch`.
-- **Status**: ✅ done — SPX + SPY × 2020-2024.
+- **Script**: `scripts/build_gex_features.py`, `build_gex_features.sbatch` (env overrides: `TICKERS`, `START_YEAR`, `END_YEAR`).
+- **Mapping** (`TARGET_TO_OPTIONS_TICKER` in `build_options_panel.py`):
+  - ES → SPX
+  - NQ → NDX
+  - RTY → RUT
+  - YM → DJX
+- **Status**: ✅ all 5 tickers × 2020-2024 built (25 profiles).
 
 ### S6. Futures feature panel (Phase 2b — bar-derived per-instrument features)
 - **Reads**: Phase A+B bars (or Phase A with `--no-l2-deep`) + VX1/VX2/VX3 bars (optional) + 5-sec bars (optional, for VPIN/Hawkes).
@@ -223,11 +326,34 @@ python -m pytest tests/ -q
 
 ---
 
-## V1 feature inventory (single-contract ES panel)
+## V1 feature inventory
 
-The end-to-end smoke run on ES 2024 (commits through 5d41a1e + Phase F)
-produces **416 cols / 9,970 valid labeled rows** without Phase E and
-**~427 cols** once Phase E is wired in (see "Phase E status" below).
+Two distinct panels. Trading instruments (ES/NQ/RTY/YM) get the FULL feature
+set; macro-feed contracts get a leaner subset. Cross-sectional adds another
+~850 features per target.
+
+### Per-instrument single-panel size
+
+| Panel | Size | Used for |
+|---|---:|---|
+| Trading 4 (ES/NQ/RTY/YM) full | **~446 cols × ~9-10K labeled rows** | Direct modeling target |
+| Trading 4 partial (only ES has Phase E + 5-sec engines as of 2026-04-25 evening) | ~416 / ~446 | Mid-build state |
+| Macro-feed 26 (no Phase A+B / no Phase E / no 5-sec) | **~280 cols × ~24K unlabeled rows** | Cross-sectional inputs only |
+
+### Cross-sectional panel size
+
+After `build_cross_panel.py` runs (per target):
+
+| Layer | Cols added |
+|---:|---|
+| Target's single panel | ~446 |
+| + CS ranks (14 BASE × 30 instruments × 2 scopes) | ~840 |
+| + Cross-asset composites (DXY, rates curve, risk-on/off, rolling corrs) | ~10 |
+| + Regime × direction interactions (per target) | ~13 |
+| **Total cross panel per target** | **~1,310** |
+
+Pre-ILP. ILP feature-selection prunes to ~50-80 modeling features at ρ<0.45
+pairwise correlation.
 
 ### Column-group breakdown (per labeled bar)
 
@@ -289,11 +415,37 @@ under `[col-summary]`.
 | **Cross-sectional features** | Phase 4 orchestrator (`build_cross_panel.py`) ready; needs single panels for >1 instrument. | Run multi-instrument production build. |
 | **Tier 4 equity sector ETF features** | Needs new equity 1-sec TAQ ingest pipeline. | V2 — only if V1 OOS underperforms. |
 
-### Phase E status
+### Current production state (2026-04-25 evening)
 
-- **Bar-builder code**: ✅ complete (`scripts/build_phase_e_bars.py`, 22 cols emitted)
-- **Production build**: 🟡 SLURM 6922290 running for ES 2020-2024 (~2h ETA at writing)
-- **Final end-to-end smoke** (with Phase E enabled): pending SLURM completion. Expected col count: **~427**.
+| Stage | Status |
+|---|---|
+| Phase A bars (30 instruments) | ✅ done |
+| Phase A+B bars (ES/NQ/RTY/YM) | ✅ done |
+| VX1/VX2/VX3 bars | ✅ done (1292 days × 3 slots) |
+| 5-sec bars: ES | ✅ done (1299 days) |
+| 5-sec bars: NQ/RTY/YM | ⏳ pending — to be submitted post-multi-instrument-build |
+| Phase E bars: ES | ✅ done (1287 days; 8 missing-source-file days) |
+| Phase E bars: NQ/RTY/YM | ⏳ pending — to be submitted post-multi-instrument-build |
+| GEX profiles (SPX/SPY/NDX/RUT/DJX × 5 yr) | ✅ done (25 profiles) |
+| Phase 2b futures panels (30 instruments × 5 yrs) | 🟡 in-flight on quartz — ~70/150 done |
+| Phase 2b options panels (4 trading × 5 yrs) | 🟡 chained — pending futures completion |
+| Phase 3 single panels (30 instruments × 5 yrs) | 🟡 chained — pending |
+| Phase 4 cross-sectional panels (4 × 5 yrs) | ⏳ blocked on Phase 3 + NQ/RTY/YM 5-sec/Phase-E re-builds |
+
+### Next actions queue
+
+After the in-flight multi-instrument single-panel build completes:
+
+1. **Submit 5-sec bar builds for NQ, RTY, YM** (3 sbatches in parallel, ~60 min each).
+2. **Submit Phase E bar builds for NQ, RTY, YM** (3 sbatches in parallel, ~3-4h each).
+   - Steps 1 and 2 can run truly in parallel (no inter-dependency).
+3. **Re-run futures + single panels for NQ/RTY/YM** to pick up the new sub-bar-engine + Phase-E features:
+   - 3 × `INSTR=X sbatch scripts/build_futures_panel.sbatch`
+   - Chained: 3 × `INSTR=X sbatch --dependency=afterok:<fut> scripts/build_single_panel.sbatch`
+4. **Submit cross-sectional panels** for all 4 targets:
+   - `sbatch scripts/build_cross_panel.sbatch` (array=0-19, 4 targets × 5 years).
+
+Total additional wall time: ~5-6h from now.
 
 ---
 
