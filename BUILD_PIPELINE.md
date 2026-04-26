@@ -288,7 +288,61 @@ input dependencies. SLURM array tasks are independent days × instruments.
 - **Reads**: `features/single/{INSTR}_{YEAR}.parquet` for all 30 instruments.
 - **Writes**: `features/cross/{TARGET}_{YEAR}.parquet`.
 - **Script**: `scripts/build_cross_panel.py`, `build_cross_panel.sbatch` (array=0-19 over 4 targets × 5 years).
-- Adds Gauss-Rank universe + per-asset-class ranks, synthetic DXY, rates curve, risk-on/off, cross-asset rolling correlations on top of target's single panel.
+- **Status**: ✅ done — 20 cross panels on disk (4 × 5).
+
+**Pipeline inside the script**:
+
+```
+1. Probe parquet schemas via pq.read_schema (cheap metadata) for all 30 instruments
+   → identify which CS_VALUE_COLS each panel actually has
+
+2. Scan-load only ts + needed value cols for each panel via pl.scan_parquet().select().collect()
+   → ~30× memory reduction vs read-then-narrow
+
+3. Per-instrument dedupe on ts (.unique(subset=["ts"], keep="first"))
+   → CRITICAL: without dedupe, sequential left-joins explode cartesian-style
+     (24K rows → 30M rows after 16 joins, OOM at 30M)
+
+4. build_wide_cross_asset_frame:
+   master ts grid (sorted union of all per-instrument ts) +
+   30 sequential left-joins onto master (one per instrument)
+   → ~24K rows × 421 cols (14 BASE × 30 instr + ts)
+
+5. attach_cross_sectional_ranks:
+   For each base value × each scope {universe, asset-class}:
+     attach_gauss_rank_cs → rank → quantile → inverse-CDF (bounded standard-normal)
+   → +840 cols (14 × 30 × 2)
+
+6. attach_cross_asset_composites:
+   synthetic_dxy_logret, rates curve spreads (2s5s/5s10s/2s10s/10s30s/butterfly),
+   risk-on/off composite, cross-asset rolling corrs
+   → +22 cols
+
+7. Filter wide frame to drop other-target {target}_* prefix cols and
+   other-target rolling-corr cols (we keep only the running target's corrs)
+   → -26 cols
+
+8. Left-join filtered wide frame onto target's single panel on ts
+   → +445 cols (target's full single panel from Phase 3, ~446 cols)
+
+9. attach_regime_interactions:
+   12-13 multiplicative interactions (regime × direction). Naming:
+   ix_<regime>_x_<direction>. Pre-computed so ILP can rank them on
+   standalone |IC| — tree models can't easily learn multiplicative
+   interactions through splits.
+   → +16 cols
+
+→ ~1,718 cols × ~9-10K labeled rows per (target, year).
+```
+
+**SBATCH env vars** (in `build_cross_panel.sbatch`):
+- `POLARS_MAX_THREADS=1` — bound polars thread pool to avoid per-thread buffer multiplication
+- `POLARS_STREAMING_CHUNK_SIZE=10000` — control streaming engine memory usage
+- `--mem=128G` — sufficient with the dedupe fix; was insufficient before
+
+**Common gotcha**: per-instrument single panels can have duplicate ts rows
+(from the futures+options join when options has multi-row-per-bar). The dedupe
+step is essential — without it, the wide-join is a 30-way cartesian explosion.
 
 ---
 
@@ -342,18 +396,35 @@ set; macro-feed contracts get a leaner subset. Cross-sectional adds another
 
 ### Cross-sectional panel size
 
-After `build_cross_panel.py` runs (per target):
+After `build_cross_panel.py` runs (per target). Validated on ES 2021 build
+(job 8895087_4):
 
-| Layer | Cols added |
-|---:|---|
-| Target's single panel | ~446 |
-| + CS ranks (14 BASE × 30 instruments × 2 scopes) | ~840 |
-| + Cross-asset composites (DXY, rates curve, risk-on/off, rolling corrs) | ~10 |
-| + Regime × direction interactions (per target) | ~13 |
-| **Total cross panel per target** | **~1,310** |
+| Layer | Cols added | Cumulative |
+|---|---:|---:|
+| Wide frame (14 BASE × 30 instruments × 2 ranks + ts) | 421 | 421 |
+| + CS Gauss-Rank universe + per-asset-class | +840 | 1,261 |
+| + Cross-asset composites (DXY, rates curve, rolling corrs) | +22 | 1,283 |
+| − Filter to target (drop other-target corrs) | −26 | 1,257 |
+| + Merged with target's full single panel | +445 | 1,702 |
+| + Regime × direction interactions | +16 | **1,718** |
 
-Pre-ILP. ILP feature-selection prunes to ~50-80 modeling features at ρ<0.45
-pairwise correlation.
+**Total per cross panel: ~1,718 cols × ~9-10K labeled rows.**
+
+Pre-ILP. ILP feature-selection then prunes to ~50-80 modeling features at
+ρ<0.45 pairwise correlation.
+
+### Cross-sectional feature inventory by group
+
+| Group | Cols | Naming convention |
+|---|---:|---|
+| Single panel passthrough | 446 | (everything from Phase 3, see "Per-instrument single panel" above) |
+| CS Gauss-Rank — universe scope (vs all 30) | 420 | `cs_universe_<INSTR>_<base_value>` |
+| CS Gauss-Rank — within asset class scope | 420 | `cs_class_<CLASS>_<INSTR>_<base_value>` |
+| Synthetic DXY | 1 | `synthetic_dxy_logret` |
+| Rates curve spreads | 5 | `curve_2s5s`, `curve_5s10s`, `curve_2s10s`, `curve_10s30s`, `butterfly_2s5s10s` |
+| Cross-asset rolling correlations (per-target) | ~4 | `corr_{TARGET}_vs_{gold,oil,ZN,DXY}_w60` |
+| Other composites (risk-on/off etc.) | ~12 | varies |
+| Regime × direction interactions | 16 | `ix_<regime>_x_<direction>` |
 
 ### Column-group breakdown (per labeled bar)
 
@@ -430,22 +501,26 @@ under `[col-summary]`.
 | Phase 2b futures panels (30 instruments × 5 yrs) | 🟡 in-flight on quartz — ~70/150 done |
 | Phase 2b options panels (4 trading × 5 yrs) | 🟡 chained — pending futures completion |
 | Phase 3 single panels (30 instruments × 5 yrs) | 🟡 chained — pending |
-| Phase 4 cross-sectional panels (4 × 5 yrs) | ⏳ blocked on Phase 3 + NQ/RTY/YM 5-sec/Phase-E re-builds |
+| Phase 4 cross-sectional panels (4 × 5 yrs) | ✅ done — 20 cross panels on disk (~1,718 cols × 9-10K rows each) |
 
 ### Next actions queue
 
-After the in-flight multi-instrument single-panel build completes:
+All 4 phases (bars + per-source panels + single panels + cross panels) ✅ done
+end-to-end for 2020-2024 across 30 instruments. The data foundation is ready.
 
-1. **Submit 5-sec bar builds for NQ, RTY, YM** (3 sbatches in parallel, ~60 min each).
-2. **Submit Phase E bar builds for NQ, RTY, YM** (3 sbatches in parallel, ~3-4h each).
-   - Steps 1 and 2 can run truly in parallel (no inter-dependency).
-3. **Re-run futures + single panels for NQ/RTY/YM** to pick up the new sub-bar-engine + Phase-E features:
-   - 3 × `INSTR=X sbatch scripts/build_futures_panel.sbatch`
-   - Chained: 3 × `INSTR=X sbatch --dependency=afterok:<fut> scripts/build_single_panel.sbatch`
-4. **Submit cross-sectional panels** for all 4 targets:
-   - `sbatch scripts/build_cross_panel.sbatch` (array=0-19, 4 targets × 5 years).
+Remaining V1 work:
 
-Total additional wall time: ~5-6h from now.
+1. **IC + t-stat dashboard** — for each of ~1,718 cross panel features, compute
+   information coefficient (rank corr) vs the V1 triple-barrier label across
+   all 4 trading targets, with t-statistic. Identify top features per target.
+2. **ILP feature selection** — greedy MWIS at ρ<0.45 pairwise correlation
+   constraint to prune 1,718 → ~50-80 model-input features.
+3. **LightGBM training** — walk-forward CV with embargo + purge = label
+   horizon T (8 bars for ES). Per-target 3-class classifier. Trained on
+   IS = 2020-2023, evaluated on OOS = 2024.
+4. **Backtest + Sharpe attribution**.
+5. (Optional) **2025 OOS extension** — when 2025 raw Algoseek data lands,
+   re-run all 9 phases for the 2025 year-task only.
 
 ---
 
