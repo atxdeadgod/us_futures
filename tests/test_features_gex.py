@@ -147,6 +147,63 @@ def test_attach_gex_features_adds_distance_cols():
     assert row["distance_to_max_put_oi"] == 150.0
 
 
+def test_attach_gex_features_handles_weekend_gap():
+    """Monday bar must asof-back to Friday's profile, not return null because Sunday
+    isn't in the profile. This was the 22%-null bug pre-fix."""
+    fri = date(2024, 1, 5)   # Friday
+    mon_bar = datetime(2024, 1, 8, 14, 30, tzinfo=timezone.utc)  # Monday
+    bars = pl.DataFrame({
+        "ts": [mon_bar],
+        "close": [5050.0],
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+
+    daily_gex = pl.DataFrame(
+        [
+            {
+                "date": fri,
+                "total_gex": 1.0e9, "gex_sign": 1, "zero_gamma_strike": 5000.0,
+                "max_call_oi_strike": 5100.0, "max_put_oi_strike": 4900.0,
+                "gex_0dte_share": 0.3, "gex_0dte_only": 3.0e8, "gex_without_0dte": 7.0e8,
+            }
+        ]
+    ).with_columns(pl.col("date").cast(pl.Date))
+    basis = _mk_spot([{"date": fri, "spot": 0.0}]).rename({"spot": "basis"})
+
+    out = gex.attach_gex_features(bars, daily_gex, basis)
+    row = out.row(0, named=True)
+    # Monday should pick up Friday's profile via asof-backward (Friday + 1 = Saturday <= Monday)
+    assert row["total_gex"] == 1.0e9, f"Monday bar should asof-back to Friday's profile, got {row['total_gex']}"
+    assert row["distance_to_zero_gamma_flip"] == 50.0
+
+
+def test_compute_daily_gex_profile_no_crossing_uses_spot_fallback():
+    """When dealer cum_gamma stays one-sided (heavy call OI dominating with no
+    offsetting put OI), the algorithm should fall back to the daily SPOT price
+    rather than emitting null. This was the 81%-null bug pre-fix.
+
+    Using spot makes distance_to_zero_gamma_flip ≈ 0 on these days, a neutral
+    "no flip detected" signal — preferable to picking the lowest strike (which
+    happens with naive closest-to-zero |cum_gamma| logic).
+    """
+    d = date(2024, 1, 2)
+    # All calls (dealer SHORT) and zero puts → cum_gamma stays negative across all strikes
+    chain = _mk_chain([
+        {"date": d, "strike_price": 4900.0, "exdate": d, "cp_flag": "C",
+         "open_interest": 100.0, "gamma": 0.01},
+        {"date": d, "strike_price": 5000.0, "exdate": d, "cp_flag": "C",
+         "open_interest": 200.0, "gamma": 0.02},
+        {"date": d, "strike_price": 5100.0, "exdate": d, "cp_flag": "C",
+         "open_interest": 100.0, "gamma": 0.01},
+    ])
+    spot = _mk_spot([{"date": d, "spot": 5000.0}])
+    profile = gex.compute_daily_gex_profile(chain, spot)
+    row = profile.row(0, named=True)
+    # No real crossing → fallback to spot 5000.0. Critically — NOT null, NOT
+    # the degenerate first strike (4900).
+    assert row["zero_gamma_strike"] is not None
+    assert row["zero_gamma_strike"] == 5000.0
+
+
 def test_zero_gamma_cross_flag():
     """ES oscillates across flip → flag fires in the cross window."""
     distance_series = pl.Series([-10.0, -8.0, -3.0, 2.0, 4.0, 3.0])  # crosses zero at idx 3

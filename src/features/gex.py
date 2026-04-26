@@ -114,12 +114,34 @@ def compute_daily_gex_profile(
     by_strike = by_strike.with_columns(
         pl.col("gamma_at_strike").cum_sum().over("date").alias("cum_gamma")
     )
-    # Zero-flip strike = first strike where cum_gamma >= 0 (transitioning from negative
-    # below-the-money to positive above-the-money). If no crossing, use the median strike.
-    flip = (
+    # Zero-flip strike: prefer the first strike where cum_gamma >= 0 (the actual
+    # transition from below-the-money negative gamma to above-the-money positive
+    # gamma). When the cumulative sum stays one-sided across all strikes (heavy
+    # call OI dominating, common in 2024 with concentrated 0DTE call flow), no
+    # strike satisfies cum >= 0 — fall back to the daily SPOT price as a neutral
+    # "no flip detected, assume at-the-money" signal. This makes
+    # distance_to_zero_gamma_flip ≈ 0 on those days, which the model can learn
+    # as the "GEX undefined" regime.
+    #
+    # We deliberately do NOT fall back to the strike where |cum_gamma| is
+    # smallest, since |cum_gamma| is structurally smallest at the FIRST (lowest)
+    # strike before any contributions accumulate — picking that strike yields a
+    # degenerate value far below spot.
+    real_flip = (
         by_strike.filter(pl.col("cum_gamma") >= 0)
         .group_by("date")
-        .agg(pl.col("strike_price").min().alias("zero_gamma_strike"))
+        .agg(pl.col("strike_price").min().alias("_real_flip"))
+    )
+    spot_fallback = spot_daily.select([
+        pl.col("date"),
+        pl.col("spot").alias("_spot_fallback"),
+    ])
+    flip = (
+        spot_fallback.join(real_flip, on="date", how="left")
+        .with_columns(
+            pl.coalesce(["_real_flip", "_spot_fallback"]).alias("zero_gamma_strike")
+        )
+        .select(["date", "zero_gamma_strike"])
     )
 
     # Max-OI strikes per side
@@ -191,19 +213,37 @@ def attach_gex_features(
     # Bar-level date (in UTC — for GEX it's fine; we're joining on daily granularity)
     bars = bars.with_columns(pl.col(ts_col).dt.date().alias("_bar_date"))
 
-    # Asof-backward: GEX profile from previous day (or today if it's the EOD we're using)
-    # For strict no-lookahead, we could use yesterday's profile. For simplicity and since
-    # daily_gex is EOD-of-day-T, we shift by 1 day so bar at T uses T-1 EOD profile.
-    daily_shifted = daily_gex.with_columns(
-        (pl.col("date") + pl.duration(days=1)).alias("_applies_from_date")
-    ).drop("date").rename({"_applies_from_date": "_bar_date"})
+    # Asof-backward join: bar at date T picks up the most recent EOD profile from
+    # date < T. We shift the profile by +1 day so the SOONEST it can apply is the
+    # NEXT calendar day (no lookahead — we never use today's EOD profile to inform
+    # today's intraday bars). Then asof-backward handles weekends + holidays:
+    # a Monday bar finds Friday's shifted profile (Friday + 1 = Saturday) without
+    # needing a Monday-keyed entry. Tolerance=5d covers long weekends.
+    daily_shifted = (
+        daily_gex
+        .with_columns((pl.col("date") + pl.duration(days=1)).alias("_apply_date"))
+        .drop("date")
+        .sort("_apply_date")
+    )
+    basis_shifted = (
+        es_spx_basis
+        .with_columns((pl.col("date") + pl.duration(days=1)).alias("_apply_date"))
+        .drop("date")
+        .sort("_apply_date")
+    )
 
-    basis_shifted = es_spx_basis.with_columns(
-        (pl.col("date") + pl.duration(days=1)).alias("_applies_from_date")
-    ).drop("date").rename({"_applies_from_date": "_bar_date"})
-
-    bars = bars.join(daily_shifted, on="_bar_date", how="left")
-    bars = bars.join(basis_shifted, on="_bar_date", how="left")
+    bars = bars.sort("_bar_date").join_asof(
+        daily_shifted, left_on="_bar_date", right_on="_apply_date",
+        strategy="backward", tolerance="5d",
+    )
+    bars = bars.join_asof(
+        basis_shifted, left_on="_bar_date", right_on="_apply_date",
+        strategy="backward", tolerance="5d",
+    )
+    # Drop the helper join keys that join_asof carries over.
+    for c in ("_apply_date", "_apply_date_right"):
+        if c in bars.columns:
+            bars = bars.drop(c)
 
     # ES-adjusted strike levels (§8.K)
     bars = bars.with_columns(
