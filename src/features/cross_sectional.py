@@ -175,3 +175,70 @@ def attach_cross_asset_composites(
                 out_col=f"corr_{target}_vs_{label}_w{rolling_corr_window}",
             )
     return df
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — regime × direction multiplicative interactions
+# ---------------------------------------------------------------------------
+
+def attach_regime_interactions(
+    panel: pl.DataFrame,
+    target: str,
+    rolling_corr_window: int = 60,
+) -> pl.DataFrame:
+    """Pre-compute multiplicative interactions: regime feature × direction feature.
+
+    Tree-based models (LightGBM) split one feature at a time, so capturing
+    "OFI predicts differently when dealers are short gamma" requires deep tree
+    paths and ends up buried in low-population leaves. Pre-computing the
+    interaction makes it a first-class feature that ILP can rank by standalone
+    |IC|. If a regime feature has weak direct IC but strong interacted IC,
+    ILP picks the interaction; if the regime is useful directly, ILP keeps that.
+
+    Operates on the FINAL cross-panel frame (target's per-bar features +
+    cross-asset composites + cross-sectional ranks). Skips any interaction
+    whose source columns aren't both present.
+
+    Output column naming convention: `ix_<regime>_x_<direction>` so all
+    interactions can be filtered with a single prefix match downstream.
+    """
+    cols = set(panel.columns)
+    aggs: list[pl.Expr] = []
+
+    def _add_if(name: str, *required: str):
+        """Append `pl.col(req[0]) * pl.col(req[1])` if all requireds exist."""
+        if all(c in cols for c in required):
+            aggs.append(
+                (pl.col(required[0]) * pl.col(required[1])).alias(name)
+            )
+
+    # === Dealer-positioning × flow (the "GEX as multiplier" hypothesis) ===
+    # Hypothesis: OFI signal flips when dealers are short gamma
+    # (positive OFI accelerates moves) vs long gamma (positive OFI dampened).
+    _add_if("ix_gex_sign_x_ofi_tc_z_w30", "gex_sign", "ofi_tc_z_w30")
+    _add_if("ix_gex_sign_x_log_return", "gex_sign", "log_return")
+    _add_if("ix_dist_zero_gamma_x_ofi_tc_z", "distance_to_zero_gamma_flip_bp", "ofi_tc_z_w30")
+    _add_if("ix_dist_zero_gamma_x_log_return", "distance_to_zero_gamma_flip_bp", "log_return")
+
+    # === Vol-regime × flow ===
+    # Same OFI level should mean different things in calm vs stressed vol regime.
+    _add_if("ix_vx1_zscore_x_vol_surprise_w20", "vx1_zscore_w20", "vol_surprise_w20")
+    _add_if("ix_vx1_zscore_x_ofi_tc_z_w30", "vx1_zscore_w20", "ofi_tc_z_w30")
+    _add_if("ix_vx_calendar_ratio_x_cvd_change", "vx_calendar_ratio", "cvd_change")
+    _add_if("ix_vol_ratio_short_long_x_ofi_tc_z", "vol_ratio_short_long", "ofi_tc_z_w30")
+    _add_if("ix_vol_of_vol_w60_x_jump_indicator", "vol_of_vol_w60", "jump_indicator_w20")
+
+    # === Macro regime × direction ===
+    _add_if("ix_dxy_logret_x_log_return", "synthetic_dxy_logret", "log_return")
+    # Per-target rolling cross-asset correlations × flow
+    for label in ("gold", "oil", "ZN", "DXY"):
+        corr_col = f"corr_{target}_vs_{label}_w{rolling_corr_window}"
+        _add_if(f"ix_{corr_col}_x_ofi_tc_z", corr_col, "ofi_tc_z_w30")
+
+    # === Tail / event regime × event signal ===
+    _add_if("ix_rolling_kurt_x_jump_indicator", "rolling_kurt_w60", "jump_indicator_w20")
+    _add_if("ix_range_compression_x_log_return", "range_compression_ratio_w20", "log_return")
+
+    if not aggs:
+        return panel
+    return panel.with_columns(aggs)

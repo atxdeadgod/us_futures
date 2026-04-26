@@ -25,5 +25,5 @@ conda activate bhft
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/features}"
 mkdir -p "$OUT_ROOT/futures"
 
-python3 -u "$HOME/us_futures/scripts/build_futures_panel.py" \
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_futures_panel.py \
     --instrument "$INSTR" --year "$YEAR" --out "$OUT_ROOT"

@@ -39,13 +39,21 @@ if str(REPO) not in sys.path:
 
 from src.features import cross_sectional
 
-# Subset of BASE_VALUE_COLS used as cross-sectional inputs. Keeping this
-# focused (~7 cols × 30 instruments × 2 z-types = ~420 rank cols) avoids
-# blowing up the panel width to several thousand columns.
+# Subset of BASE_VALUE_COLS used as cross-sectional inputs. Two tiers:
+# Tier 1 (directional): "is this instrument outperforming peers?"
+# Tier 2 (vol/regime):   "is this instrument's vol regime unusual vs peers?"
+# Pure-noise / sparse / contract-scale features (implied volume, large_trade,
+# spread_to_mid_bps absolute) intentionally excluded — they don't normalize
+# cleanly across the 30-contract universe.
 CS_VALUE_COLS: list[str] = [
+    # Tier 1 — directional
     "log_return", "abs_log_return", "log_volume",
-    "ofi", "realized_vol_w20", "range_vol_parkinson_w20",
-    "vol_surprise_w60",
+    "ofi", "aggressor_ratio", "cvd_change",
+    "vwap_deviation",
+    # Tier 2 — vol / regime
+    "realized_vol_w20", "realized_vol_w60", "realized_vol_w120",
+    "vol_surprise_w20", "vol_surprise_w60",
+    "amihud_illiq_w20", "range_vol_parkinson_w20",
 ]
 
 
@@ -131,6 +139,15 @@ def main() -> int:
     add_cols = ["ts"] + [c for c in wide_filtered.columns if c != "ts" and c not in already]
     out = target_panel.join(wide_filtered.select(add_cols), on="ts", how="left")
     print(f"[merge] target + cross: rows={out.height:,}  cols={len(out.columns)}")
+
+    # Regime × direction interactions (must run AFTER the merge so the
+    # interaction function can see both target's per-bar features AND the
+    # cross-asset composites that came from the wide frame).
+    print("[cs] regime × direction interactions")
+    out = cross_sectional.attach_regime_interactions(
+        out, target=args.target, rolling_corr_window=args.rolling_corr_window,
+    )
+    print(f"  after interactions: cols={len(out.columns)}")
 
     out_path = cross_dir / f"{args.target}_{args.year}.parquet"
     out.write_parquet(out_path, compression="zstd", compression_level=3)

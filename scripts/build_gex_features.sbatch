@@ -21,9 +21,15 @@ mkdir -p /N/project/ksb-finance-backtesting/data/gex_features
 
 CHAIN_ROOT="${CHAIN_ROOT:-/N/project/ksb-finance-backtesting/data/spx_options_chain}"
 OUT_ROOT="${OUT_ROOT:-/N/project/ksb-finance-backtesting/data/gex_features}"
+TICKERS="${TICKERS:-SPX,SPY}"
+START_YEAR="${START_YEAR:-2020}"
+END_YEAR="${END_YEAR:-2024}"
 
-python3 -u "$HOME/us_futures/scripts/build_gex_features.py" \
-    --tickers "SPX,SPY" \
-    --start-year 2020 --end-year 2024 \
+# Code lives on the BigRed200 home, but slate (where conda is) is shared, and
+# /N/u/gargru/BigRed200/... is readable from quartz too — so this sbatch
+# works from either cluster's submitter.
+python3 -u /N/u/gargru/BigRed200/us_futures/scripts/build_gex_features.py \
+    --tickers "$TICKERS" \
+    --start-year "$START_YEAR" --end-year "$END_YEAR" \
     --spx-chain-root "$CHAIN_ROOT" \
     --out-root "$OUT_ROOT"

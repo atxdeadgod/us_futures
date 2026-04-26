@@ -74,6 +74,16 @@ def main() -> int:
     bars_phase_a = Path(args.bars_phase_a_root)
     bars_phase_ab = Path(args.bars_phase_ab_root)
 
+    # Auto-detect: fall back to Phase A only if Phase A+B isn't built for this
+    # instrument. The 26 macro/macro-feed contracts (GC, CL, 6E, ZN, ...) don't
+    # have Phase A+B (depth bars) — only Phase A. Without this auto-fallback,
+    # the multi-instrument production run would crash on every non-trading-4
+    # contract.
+    if not args.no_l2_deep:
+        if not (bars_phase_ab / args.instrument / args.horizon).exists():
+            print(f"[auto] Phase A+B not found for {args.instrument} at {bars_phase_ab}; "
+                  f"falling back to Phase A only (skipping L2-deep features)")
+            args.no_l2_deep = True
     src_root = bars_phase_a if args.no_l2_deep else bars_phase_ab
     print(f"[load] {args.instrument} {args.horizon} from {src_root}")
     bars = _stitch_per_day_parquets(src_root, args.instrument, args.horizon, args.year)

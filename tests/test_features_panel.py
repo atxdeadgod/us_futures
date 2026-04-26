@@ -236,6 +236,73 @@ def test_step3_wide_join_outer_handles_missing_ts():
 
 
 # ---------------------------------------------------------------------------
+# Regime × direction interactions
+# ---------------------------------------------------------------------------
+
+def test_attach_regime_interactions_emits_when_inputs_present():
+    """All required inputs present → all defined interactions emitted."""
+    from src.features.cross_sectional import attach_regime_interactions
+    df = pl.DataFrame({
+        "ts": [datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)],
+        # Direction features
+        "log_return": [0.001],
+        "ofi_tc_z_w30": [0.5],
+        "cvd_change": [10.0],
+        "vol_surprise_w20": [0.3],
+        "jump_indicator_w20": [0.0],
+        # Regime features
+        "gex_sign": [-1.0],
+        "distance_to_zero_gamma_flip_bp": [-25.0],
+        "vx1_zscore_w20": [1.5],
+        "vx_calendar_ratio": [0.95],
+        "vol_ratio_short_long": [1.2],
+        "vol_of_vol_w60": [0.0001],
+        "synthetic_dxy_logret": [0.0005],
+        "rolling_kurt_w60": [3.5],
+        "range_compression_ratio_w20": [0.4],
+        "corr_ES_vs_gold_w60": [0.3],
+        "corr_ES_vs_oil_w60": [-0.1],
+        "corr_ES_vs_ZN_w60": [0.4],
+        "corr_ES_vs_DXY_w60": [-0.5],
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+    out = attach_regime_interactions(df, target="ES")
+    expected = [
+        "ix_gex_sign_x_ofi_tc_z_w30",
+        "ix_gex_sign_x_log_return",
+        "ix_dist_zero_gamma_x_ofi_tc_z",
+        "ix_vx1_zscore_x_vol_surprise_w20",
+        "ix_vx_calendar_ratio_x_cvd_change",
+        "ix_vol_ratio_short_long_x_ofi_tc_z",
+        "ix_dxy_logret_x_log_return",
+        "ix_rolling_kurt_x_jump_indicator",
+        "ix_range_compression_x_log_return",
+    ]
+    for c in expected:
+        assert c in out.columns, f"missing interaction: {c}"
+    # Per-target rolling-corr × ofi
+    assert any(c.startswith("ix_corr_ES_vs_gold_w60_x_ofi") for c in out.columns)
+    # Numerical sanity: gex_sign(-1) × ofi(0.5) = -0.5
+    assert abs(out["ix_gex_sign_x_ofi_tc_z_w30"][0] - (-0.5)) < 1e-9
+
+
+def test_attach_regime_interactions_skips_missing_silently():
+    """If a regime or direction col is absent, the related interaction is skipped."""
+    from src.features.cross_sectional import attach_regime_interactions
+    df = pl.DataFrame({
+        "ts": [datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)],
+        "log_return": [0.001],
+        "ofi_tc_z_w30": [0.5],
+        # NO regime cols at all
+    }).with_columns(pl.col("ts").cast(pl.Datetime("ns", "UTC")))
+    out = attach_regime_interactions(df, target="ES")
+    # No regime cols → no interactions added
+    assert all(not c.startswith("ix_") for c in out.columns)
+    # The original cols are still there
+    assert "log_return" in out.columns
+    assert "ofi_tc_z_w30" in out.columns
+
+
+# ---------------------------------------------------------------------------
 # Step 4: attach_cross_sectional_ranks
 # ---------------------------------------------------------------------------
 

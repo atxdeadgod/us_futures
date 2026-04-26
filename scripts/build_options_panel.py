@@ -32,10 +32,21 @@ if str(REPO) not in sys.path:
 
 from src.features import external_sources
 
-# Map: futures target → options ticker whose chain feeds it
+# Map: futures target → options ticker whose chain feeds it.
+# Each maps the index futures to the cash-settled index option chain that
+# tracks the same underlying:
+#   ES (S&P 500 futures)        → SPX (S&P 500 index options)
+#   NQ (Nasdaq 100 futures)     → NDX (Nasdaq 100 index options)
+#   RTY (Russell 2000 futures)  → RUT (Russell 2000 index options)
+#   YM (Dow Jones futures)      → DJX (Dow Jones index options)
+# Index options (vs ETF options like SPY/QQQ/IWM/DIA) are preferred because
+# they share the same strike grid as the futures and centralize all institutional
+# OI in one chain — cleaner GEX signal.
 TARGET_TO_OPTIONS_TICKER = {
     "ES": "SPX",
-    # "NQ": "NDX",  # V1.5
+    "NQ": "NDX",
+    "RTY": "RUT",
+    "YM": "DJX",
 }
 
 
