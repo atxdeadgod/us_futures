@@ -136,6 +136,18 @@ def _load_target_panels(cross_root: Path, target: str, years: tuple[int, ...]) -
     ).sort("ts")
 
 
+def _load_per_year_panels(
+    cross_root: Path, target: str, years: tuple[int, ...]
+) -> dict[int, pl.DataFrame]:
+    """Return {year: panel_df} for every year that has a parquet."""
+    out: dict[int, pl.DataFrame] = {}
+    for yr in years:
+        path = cross_root / f"{target}_{yr}.parquet"
+        if path.exists():
+            out[yr] = pl.read_parquet(path).sort("ts")
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--target", required=True, choices=["ES", "NQ", "RTY", "YM"])
@@ -149,12 +161,23 @@ def main() -> int:
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    panel = _load_target_panels(cross_root, args.target, IS_YEARS)
-    if panel is None:
+    # Load per-year panels (used both individually for stability AND pooled
+    # for the aggregate IC).
+    per_year_panels = _load_per_year_panels(cross_root, args.target, IS_YEARS)
+    if not per_year_panels:
         print(f"[err] no {args.target} cross panels found under {cross_root} for {IS_YEARS}",
               file=sys.stderr)
         return 1
-    print(f"[load] {args.target} IS panel: rows={panel.height:,}  cols={len(panel.columns)}")
+    years_loaded = sorted(per_year_panels.keys())
+    print(f"[load] {args.target} IS years loaded: {years_loaded}")
+    for yr, p_df in per_year_panels.items():
+        print(f"  {yr}: rows={p_df.height:,}  cols={len(p_df.columns)}")
+
+    # Pooled panel = concat across years for the aggregate IC
+    panel = pl.concat(
+        list(per_year_panels.values()), how="diagonal_relaxed"
+    ).sort("ts")
+    print(f"[load] pooled IS panel: rows={panel.height:,}  cols={len(panel.columns)}")
 
     for required in ("label", "realized_ret"):
         if required not in panel.columns:
@@ -164,11 +187,16 @@ def main() -> int:
     feature_cols = _select_feature_columns(panel)
     print(f"[ic] feature columns: {len(feature_cols)}")
 
+    # Pre-extract target arrays (pooled + per-year)
     label_arr = panel["label"].cast(pl.Float64).to_numpy()
     ret_arr = panel["realized_ret"].to_numpy()
     ret_tc_resid = _tc_residual(panel, "realized_ret")
+    per_year_label = {
+        yr: per_year_panels[yr]["label"].cast(pl.Float64).to_numpy()
+        for yr in years_loaded
+    }
 
-    print(f"[ic] computing 4 IC variants for {len(feature_cols)} features...")
+    print(f"[ic] computing pooled IC + per-year stability for {len(feature_cols)} features...")
     rows = []
     for i, feat in enumerate(feature_cols):
         try:
@@ -179,9 +207,38 @@ def main() -> int:
         ic_ret_sp, n_ret = _ic_spearman(arr, ret_arr)
         ic_ret_pe, _ = _ic_pearson(arr, ret_arr)
         ic_ret_tc_pe, _ = _ic_pearson(arr, ret_tc_resid)
-        rows.append({
+
+        # Per-year IC vs label (Spearman). Stability tells us if the pooled
+        # IC is a regime-dependent fluke or a real effect.
+        per_year_ic: dict[int, float] = {}
+        for yr in years_loaded:
+            if feat not in per_year_panels[yr].columns:
+                per_year_ic[yr] = float("nan")
+                continue
+            yr_arr = per_year_panels[yr][feat].cast(pl.Float64, strict=False).to_numpy()
+            yr_ic, _ = _ic_spearman(yr_arr, per_year_label[yr])
+            per_year_ic[yr] = yr_ic
+
+        finite_yr_ics = [v for v in per_year_ic.values() if np.isfinite(v)]
+        if finite_yr_ics:
+            ic_yr_mean = float(np.mean(finite_yr_ics))
+            ic_yr_std = float(np.std(finite_yr_ics, ddof=0))
+            ic_yr_min = float(min(finite_yr_ics))
+            ic_yr_max = float(max(finite_yr_ics))
+            # Sign-stability: fraction of finite years with same sign as the pooled IC
+            if np.isfinite(ic_label_sp) and ic_label_sp != 0:
+                sign_pooled = np.sign(ic_label_sp)
+                sign_match = sum(1 for v in finite_yr_ics if np.sign(v) == sign_pooled)
+                sign_stable = sign_match / len(finite_yr_ics)
+            else:
+                sign_stable = float("nan")
+        else:
+            ic_yr_mean = ic_yr_std = ic_yr_min = ic_yr_max = sign_stable = float("nan")
+
+        row = {
             "feature": feat,
             "n": n_label,
+            # Pooled (aggregate over all years)
             "ic_label_spearman": ic_label_sp,
             "tstat_label_spearman": _tstat(ic_label_sp, n_label),
             "ic_ret_spearman": ic_ret_sp,
@@ -190,11 +247,20 @@ def main() -> int:
             "tstat_ret_pearson": _tstat(ic_ret_pe, n_ret),
             "ic_ret_tc_residual_pearson": ic_ret_tc_pe,
             "tstat_ret_tc_residual_pearson": _tstat(ic_ret_tc_pe, n_ret),
-            # Pre-computed |IC| for sorting
-            "abs_ic_label_spearman": abs(ic_label_sp) if np.isfinite(ic_label_sp) else float("nan"),
-            "abs_ic_ret_spearman": abs(ic_ret_sp) if np.isfinite(ic_ret_sp) else float("nan"),
-            "abs_ic_ret_tc_residual": abs(ic_ret_tc_pe) if np.isfinite(ic_ret_tc_pe) else float("nan"),
-        })
+            # Per-year IC (stability check)
+            "ic_label_yr_mean": ic_yr_mean,
+            "ic_label_yr_std": ic_yr_std,
+            "ic_label_yr_min": ic_yr_min,
+            "ic_label_yr_max": ic_yr_max,
+            "ic_label_sign_stable_frac": sign_stable,
+        }
+        for yr in years_loaded:
+            row[f"ic_label_{yr}"] = per_year_ic[yr]
+        # Pre-computed |IC| for sorting
+        row["abs_ic_label_spearman"] = abs(ic_label_sp) if np.isfinite(ic_label_sp) else float("nan")
+        row["abs_ic_ret_spearman"] = abs(ic_ret_sp) if np.isfinite(ic_ret_sp) else float("nan")
+        row["abs_ic_ret_tc_residual"] = abs(ic_ret_tc_pe) if np.isfinite(ic_ret_tc_pe) else float("nan")
+        rows.append(row)
         if (i + 1) % 200 == 0:
             print(f"  ... {i+1}/{len(feature_cols)}")
 
